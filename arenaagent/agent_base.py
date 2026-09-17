@@ -104,7 +104,21 @@ class AgentBase(ABC):
         # subject = self._get_subject_from_task()
         # logger.info("Agent[{}] is running the subject: {}", self.agent_id, subject)
 
-        while not self._current_subject_finished():
+        subject_started_at = time.perf_counter()
+        logger.info(
+            "[subject-lifecycle] agent_id={} event=subject_loop_started monotonic={:.6f}",
+            self.agent_id,
+            subject_started_at,
+        )
+
+        while True:
+            if self._current_subject_finished():
+                logger.info(
+                    "[subject-lifecycle] agent_id={} event=server_subject_finished elapsed={:.6f}s",
+                    self.agent_id,
+                    time.perf_counter() - subject_started_at,
+                )
+                break
             # logger.debug("Agent[{}] fetching task response...", self.agent_id)
             subject = self._get_subject_from_task()
             logger.info("Agent[{}] is running the subject: {}", self.agent_id, subject)
@@ -114,14 +128,45 @@ class AgentBase(ABC):
             )
             task_response = self._get_response_from_task()
             action = self.run_step(subject, task_response)
-            apply_resp = self._apply_action(action)
+            action_ready_at = time.perf_counter()
+            logger.info(
+                "[subject-lifecycle] agent_id={} event=action_ready local_finished={} elapsed={:.6f}s",
+                self.agent_id,
+                self.subject_finished,
+                action_ready_at - subject_started_at,
+            )
+            self._apply_action(action)
+            logger.info(
+                "[subject-lifecycle] agent_id={} event=action_applied local_finished={} rpc_elapsed={:.6f}s "
+                "elapsed={:.6f}s",
+                self.agent_id,
+                self.subject_finished,
+                time.perf_counter() - action_ready_at,
+                time.perf_counter() - subject_started_at,
+            )
             if self.subject_finished:
-                logger.info("Subject finished by agent action.")
+                logger.info(
+                    "[subject-lifecycle] agent_id={} event=agent_loop_exit reason=terminal_action elapsed={:.6f}s",
+                    self.agent_id,
+                    time.perf_counter() - subject_started_at,
+                )
                 break
             if self.sleep_between_steps > 0:
                 time.sleep(self.sleep_between_steps)
 
+        evaluation_started_at = time.perf_counter()
+        logger.info(
+            "[subject-lifecycle] agent_id={} event=evaluate_subject_started elapsed={:.6f}s",
+            self.agent_id,
+            evaluation_started_at - subject_started_at,
+        )
         evaluation = self._evaluate_subject()
+        logger.info(
+            "[subject-lifecycle] agent_id={} event=evaluate_subject_returned rpc_elapsed={:.6f}s elapsed={:.6f}s",
+            self.agent_id,
+            time.perf_counter() - evaluation_started_at,
+            time.perf_counter() - subject_started_at,
+        )
         self._on_subject_evaluated(evaluation)
 
     def _on_subject_evaluated(self, evaluation: dict[str, Any]) -> None:
@@ -129,6 +174,11 @@ class AgentBase(ABC):
 
     def _handle_finish(self, params: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
         self.subject_finished = True
+        logger.info(
+            "[subject-lifecycle] agent_id={} event=finish_task_selected monotonic={:.6f}",
+            self.agent_id,
+            time.perf_counter(),
+        )
         action_new = {}
         action_new[self.action_space["key"]] = str(action.get("think", "")) + str(action["output"])
         return action_new

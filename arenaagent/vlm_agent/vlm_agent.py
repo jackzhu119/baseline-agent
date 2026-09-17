@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -1048,6 +1049,15 @@ class VLMAgent(AgentBase):
         return result
 
     def _handle_submit_answer(self, params: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+        # submit_answer is the terminal action for question tasks. Ending the
+        # local subject loop lets AgentBase call evaluate_subject immediately,
+        # which is the arena protocol's explicit transition out of ANSWERING.
+        self.subject_finished = True
+        logger.info(
+            "[subject-lifecycle] agent_id={} event=submit_answer_selected monotonic={:.6f}",
+            self.agent_id,
+            time.perf_counter(),
+        )
         key = self.action_space.get("key") or "action"
         return {key: str(action["output"])}
 
