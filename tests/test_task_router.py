@@ -102,6 +102,57 @@ class TaskStrategyRouterTests(unittest.TestCase):
         self.assertEqual(action["action"], "submit_answer")
         self.assertEqual(action["output"], "餐桌上")
 
+    def test_tidyroom_runs_pick_and_put_from_semantic_assignment_without_vlm(self) -> None:
+        runtime = CompetitionRuntime()
+        subject = {"task_type": "tidyroom", "subject": "整理房间"}
+        runtime.ensure_episode(subject)
+        runtime.observe(
+            [
+                {"object_id": "shoe-1", "name": "blue shoe", "position": [1, 2, 3]},
+                {"object_id": "rack-1", "name": "shoe rack", "place_location": [10, 20, 3]},
+            ]
+        )
+        router = TaskStrategyRouter()
+        router.observe(runtime, subject)
+
+        pick = router.propose_action(subject, runtime)
+        self.assertEqual(pick["action"], "move_and_take_object")
+        runtime.record_action(pick, {"result": "success"})
+        runtime.update_hand_state(True)
+        router.observe(runtime, subject)
+        put = router.propose_action(subject, runtime)
+
+        self.assertEqual(put["action"], "put_down_sth")
+        self.assertEqual(put["parameters"]["target_location"], [10.0, 20.0, 3.0])
+
+    def test_tidyroom_finishes_after_bounded_empty_coverage_scans(self) -> None:
+        runtime = CompetitionRuntime()
+        subject = {"task_type": "tidyroom", "subject": "整理房间"}
+        runtime.ensure_episode(subject)
+        runtime.observe([])
+        router = TaskStrategyRouter()
+        router.observe(runtime, subject)
+
+        self.assertEqual(router.propose_action(subject, runtime)["action"], "turn_in_degree")
+        self.assertEqual(router.propose_action(subject, runtime)["action"], "turn_in_degree")
+        finish = router.propose_action(subject, runtime)
+
+        self.assertEqual(finish["action"], "finish_task")
+        self.assertTrue(runtime.validate_action(finish, object_in_hand=False).valid)
+
+    def test_tidyroom_does_not_finish_with_unresolved_high_confidence_clutter(self) -> None:
+        runtime = CompetitionRuntime()
+        subject = {"task_type": "tidyroom", "subject": "整理房间"}
+        runtime.ensure_episode(subject)
+        runtime.observe([{"object_id": "shoe-1", "name": "shoe", "position": [1, 2, 3]}])
+        router = TaskStrategyRouter()
+        router.observe(runtime, subject)
+
+        self.assertIsNone(router.propose_action(subject, runtime))
+        finish = runtime.validate_action({"action": "finish_task", "parameters": {}, "output": 0})
+        self.assertFalse(finish.valid)
+        self.assertIn("unresolved", finish.error)
+
 
 if __name__ == "__main__":
     unittest.main()

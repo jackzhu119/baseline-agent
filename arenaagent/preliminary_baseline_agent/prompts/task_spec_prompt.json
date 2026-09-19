@@ -1,6 +1,6 @@
 {
     "jigsaw": "以 strategy.jigsaw_spatial_grid 为主：只使用 reference_bounding、公开位置和已放置块推导的网格中心。一次只放一块；放后等待手持状态或位置变化验证。低置信度坐标不得执行，禁止复用其他局坐标。",
-    "tidyroom": "严格遵循 task_progress 状态机。只拿当前可见且未 VERIFIED 的待整理物体；拿取后必须等待手持确认，放置优先使用 placement_candidates 的 place_location，其次使用公开 world_aabb_top；放后等待验证，失败最多有限重试。",
+    "tidyroom": "严格遵循 task_progress 单物品状态机。Unknown 与非 candidate_items 禁止抓取；持物时禁止切换物品。只有 target_assignments 中与当前物体语义匹配的 selected_target 可自动放置；物体自己的 place_location 不是目的地。拿取和放置后都必须等待观测验证，UNKNOWN 不算完成。",
     "npc": "只与 npc.memory.allowed_people 中的 NPC 对话。每次询问一个 unresolved fact，优先补足任务答案所需的人物、地点、物品或要求；复用 person_locations/object_locations，禁止重复问题和无信息寒暄，事实充分后 submit_answer。",
     "raven": "由本地 Raven 专用模型裁剪题面并输出带置信度的排序候选；通用 VLM 不参与猜图。官方拒绝时最多尝试后续两个候选。",
     "counting": "程序已完成按稳定 ID/公开位置去重和有界视角扫描。单条件结果由程序直接提交；若 strategy.result 是 grouped_counts，只按其中精确数值组织任务要求的格式，不得重新看图猜数。"

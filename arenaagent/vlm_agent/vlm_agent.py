@@ -224,6 +224,7 @@ class VLMAgent(AgentBase):
                 candidate_items=set(self._tidy_classification.candidate_items),
                 rejected_items=set(self._tidy_classification.rejected_items),
                 uncertain_items=set(self._tidy_classification.uncertain_items),
+                target_surfaces=set(self._tidy_classification.target_surfaces),
             )
             prompt_visible_objects = self._tidy_classifier.relevant_objects(
                 self._tidy_classification,
@@ -628,6 +629,8 @@ class VLMAgent(AgentBase):
 
     def _trim_history_messages(self) -> list[dict[str, Any]]:
         max_history_messages = max(int(getattr(self.cfg, "max_history_messages", 15) or 0), 0)
+        if self._competition.task_type == "tidyroom":
+            max_history_messages = min(max_history_messages, 2)
         if max_history_messages == 0:
             if self.history_messages:
                 logger.debug(
@@ -698,6 +701,9 @@ class VLMAgent(AgentBase):
         visible_objects_info: list[dict[str, Any]],
         object_in_hand: Any,
     ) -> dict[str, Any]:
+        action_histories = self._trim_action_histories()
+        if self._competition.task_type == "tidyroom":
+            action_histories = action_histories[-3:]
         return {
             "api_info": api_info,
             "task_goal": subject["goal"] if isinstance(subject, dict) else subject,
@@ -709,7 +715,7 @@ class VLMAgent(AgentBase):
             "npc_subject": self._last_npc_subject or {},
             "action_res": self._serialize_prompt_status(self._last_action_res),
             "apply_resp": self._serialize_prompt_status(self._last_apply_resp),
-            "action_histories": self._trim_action_histories(),
+            "action_histories": action_histories,
             "competition_state": self._competition.prompt_context(),
         }
 

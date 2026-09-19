@@ -84,6 +84,9 @@ _TARGET_TERMS = {
     "storage",
     "area",
     "zone",
+    "bed",
+    "fridge",
+    "refrigerator",
     "桌",
     "沙发",
     "柜",
@@ -155,6 +158,120 @@ class TidyObjectClassification:
             "raw_count": self.raw_count,
             "deduplicated_count": self.deduplicated_count,
         }
+
+
+@dataclass(slots=True)
+class TidyTargetAssignment:
+    object_id: str
+    object_type: str
+    source_location: list[float] | None = None
+    candidate_targets: list[dict[str, Any]] = field(default_factory=list)
+    selected_target: dict[str, Any] | None = None
+    confidence: float = 0.0
+    reason: str = "no semantically compatible placement target"
+
+    def context(self) -> dict[str, Any]:
+        return {
+            "object_id": self.object_id,
+            "object_type": self.object_type,
+            "source_location": self.source_location,
+            "candidate_targets": self.candidate_targets,
+            "selected_target": self.selected_target,
+            "confidence": round(self.confidence, 3),
+            "reason": self.reason,
+        }
+
+
+def _location(value: Any) -> list[float] | None:
+    if isinstance(value, dict):
+        lowered = {str(key).lower(): raw for key, raw in value.items()}
+        values = [lowered.get(axis) for axis in ("x", "y", "z")]
+    elif isinstance(value, (list, tuple)) and len(value) >= 3:
+        values = list(value[:3])
+    else:
+        return None
+    try:
+        return [float(value) for value in values]
+    except (TypeError, ValueError):
+        return None
+
+
+class TidyTargetPlanner:
+    """Create conservative object-to-target assignments from public semantics."""
+
+    AUTO_SELECT_CONFIDENCE = 0.85
+    UNIQUE_MARGIN = 0.08
+
+    def assign(
+        self,
+        object_item: dict[str, Any],
+        target_items: dict[str, dict[str, Any]],
+        placement_candidates: list[dict[str, Any]],
+    ) -> TidyTargetAssignment:
+        current_id = object_id(object_item)
+        object_text = _semantic_text(object_item)
+        assignment = TidyTargetAssignment(
+            object_id=current_id,
+            object_type=object_text or "unknown",
+            # Deliberately excludes place_location: for a clutter object it is
+            # an interaction point, not evidence of the desired destination.
+            source_location=_location(object_item.get("position") or object_item.get("location")),
+        )
+        placements = {str(item.get("object_id")): item for item in placement_candidates}
+        ranked: list[dict[str, Any]] = []
+        for target_id, target_item in target_items.items():
+            semantic_score, reason = self._semantic_compatibility(object_text, _semantic_text(target_item))
+            placement = placements.get(str(target_id))
+            if semantic_score <= 0 or placement is None or _location(placement.get("location")) is None:
+                continue
+            source = str(placement.get("source") or "")
+            location_confidence = float(placement.get("confidence") or 0)
+            confidence = 0.65 * semantic_score + 0.35 * location_confidence
+            # AABB-top is useful evidence but not precise enough for automatic
+            # placement because held-object height and open surface area vary.
+            if source != "place_location":
+                confidence = min(confidence, 0.82)
+            ranked.append(
+                {
+                    "object_id": str(target_id),
+                    "location": _location(placement.get("location")),
+                    "source": source,
+                    "confidence": round(confidence, 3),
+                    "reason": reason,
+                }
+            )
+        ranked.sort(key=lambda item: (-float(item["confidence"]), str(item["object_id"])))
+        assignment.candidate_targets = ranked
+        if not ranked:
+            return assignment
+        best = ranked[0]
+        runner_up = float(ranked[1]["confidence"]) if len(ranked) > 1 else 0.0
+        assignment.confidence = float(best["confidence"])
+        if assignment.confidence >= self.AUTO_SELECT_CONFIDENCE and assignment.confidence - runner_up >= self.UNIQUE_MARGIN:
+            assignment.selected_target = best
+            assignment.reason = str(best["reason"])
+        else:
+            assignment.reason = "target evidence is ambiguous or below the automatic-placement threshold"
+        return assignment
+
+    @staticmethod
+    def _semantic_compatibility(object_text: str, target_text: str) -> tuple[float, str]:
+        mappings = (
+            ({"shoe", "shoes", "sneaker", "boot", "boots", "slipper", "鞋", "靴", "拖鞋"},
+             {"shoe", "rack", "shelf", "area", "zone", "鞋", "架", "区域"}, 0.98, "shoe storage"),
+            ({"trash", "garbage", "rubbish", "litter", "垃圾"},
+             {"trash", "garbage", "bin", "垃圾桶", "垃圾"}, 1.0, "trash receptacle"),
+            ({"pillow", "cushion", "枕头", "抱枕"},
+             {"sofa", "bed", "pillow", "cushion", "沙发", "床", "枕头", "抱枕"}, 0.96, "soft-furnishing area"),
+            ({"cup", "mug", "bottle", "杯", "瓶"},
+             {"cup", "mug", "bottle", "table", "shelf", "area", "杯", "瓶", "桌", "架", "区域"}, 0.91, "drinkware area"),
+            ({"food", "apple", "banana", "bread", "食物", "食品"},
+             {"food", "storage", "cabinet", "fridge", "refrigerator", "食品", "食物", "收纳", "柜"}, 0.95, "food storage"),
+        )
+        for object_terms, target_terms, score, reason in mappings:
+            if _contains_term(object_text, object_terms) and _contains_term(target_text, target_terms):
+                return score, reason
+        return 0.0, "no semantic object-to-target match"
 
 
 class TidyObjectClassifier:

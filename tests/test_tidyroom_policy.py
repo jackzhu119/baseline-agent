@@ -3,6 +3,7 @@ from __future__ import annotations
 from arenaagent.competition.solvers.tidyroom_policy import (
     DEFAULT_MAX_PROMPT_OBJECTS,
     TidyObjectClassifier,
+    TidyTargetPlanner,
     deduplicate_visible_objects,
 )
 
@@ -65,3 +66,27 @@ def test_prompt_projection_excludes_unknown_aabb_and_is_bounded() -> None:
     assert len(relevant) == DEFAULT_MAX_PROMPT_OBJECTS
     assert all("world_aabb" not in item for item in relevant)
     assert all(item["object_id"].startswith("shoe-") for item in relevant)
+
+
+def test_target_planner_never_uses_clutter_objects_own_place_location() -> None:
+    assignment = TidyTargetPlanner().assign(
+        {"object_id": "cup", "name": "cup", "position": [1, 2, 3], "place_location": [99, 99, 99]},
+        {},
+        [{"object_id": "cup", "source": "place_location", "location": [99, 99, 99], "confidence": 0.92}],
+    )
+
+    assert assignment.source_location == [1.0, 2.0, 3.0]
+    assert assignment.selected_target is None
+    assert assignment.candidate_targets == []
+
+
+def test_target_planner_selects_unique_semantic_surface() -> None:
+    assignment = TidyTargetPlanner().assign(
+        {"object_id": "shoe-1", "name": "blue shoe", "position": [1, 2, 3]},
+        {"rack-1": {"object_id": "rack-1", "name": "shoe rack"}},
+        [{"object_id": "rack-1", "source": "place_location", "location": [10, 20, 3], "confidence": 0.92}],
+    )
+
+    assert assignment.selected_target is not None
+    assert assignment.selected_target["object_id"] == "rack-1"
+    assert assignment.confidence >= TidyTargetPlanner.AUTO_SELECT_CONFIDENCE
