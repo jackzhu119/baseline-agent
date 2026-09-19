@@ -258,6 +258,38 @@ class VLMAgent(AgentBase):
             self._record_competition_action(strategy_action, action_res, validation)
             return action_res if isinstance(action_res, dict) else {}
 
+        # TidyRoom uses the VLM as a batch visual classifier, not as a free-form
+        # one-object-at-a-time action planner.  This prevents the real-run
+        # look_at_object loop while still spending model budget where visual
+        # semantics are genuinely needed.
+        if self._competition.task_type == "tidyroom":
+            if (
+                not object_in_hand
+                and not self._competition.progress.current_object
+                and not self._competition.progress.pending_pick
+                and not self._competition.progress.pending_place
+                and self._competition.progress.uncertain_items
+            ):
+                self._review_tidyroom_scene(image_data)
+                self._task_router.observe(self._competition, subject)
+                strategy_action = self._task_router.propose_action(subject, self._competition)
+                if strategy_action is not None:
+                    validation = self._competition.validate_action(
+                        strategy_action, object_in_hand=bool(object_in_hand)
+                    )
+                    action_res = self._execute_validated_action(validation)
+                    self._record_competition_action(strategy_action, action_res, validation)
+                    return action_res if isinstance(action_res, dict) else {}
+
+            recovery_action = self._tidyroom_progress_action()
+            if recovery_action is not None:
+                validation = self._competition.validate_action(
+                    recovery_action, object_in_hand=bool(object_in_hand)
+                )
+                action_res = self._execute_validated_action(validation)
+                self._record_competition_action(recovery_action, action_res, validation)
+                return action_res if isinstance(action_res, dict) else {}
+
         subject_text = (
             subject.get("subject") or subject.get("goal") or subject.get("task_prompt") or ""
             if isinstance(subject, dict)
@@ -399,6 +431,193 @@ class VLMAgent(AgentBase):
         self._raven_decision_cache = {}
         self._raven_next_index = {}
         self._tidy_classification = TidyObjectClassification()
+
+    def _review_tidyroom_scene(self, image_data: str | None) -> list[dict[str, Any]]:
+        """Batch-classify uncertain visible objects and persist the verdicts."""
+        if not image_data or self.vlm_client is None:
+            return []
+        progress = self._competition.progress
+        review_ids = [
+            object_id
+            for object_id in sorted(progress.uncertain_items)
+            if object_id in self._competition.visible_canonical_ids
+        ][:12]
+        if not review_ids:
+            return []
+
+        review_objects: list[dict[str, Any]] = []
+        for object_id in review_ids:
+            item = self._competition.objects.get(object_id, {})
+            compact = {"object_id": object_id}
+            for key in ("name", "semantic_type", "category", "type", "color", "shape", "position"):
+                value = item.get(key)
+                if value not in (None, "", "Unknown", "unknown", [], {}):
+                    compact[key] = value
+            review_objects.append(compact)
+
+        placements = {
+            str(item.get("object_id")): item
+            for item in self._competition.placement_candidates()
+            if item.get("object_id") not in (None, "")
+        }
+        target_options: list[dict[str, Any]] = []
+        for target_id in sorted(progress.target_surfaces & self._competition.visible_canonical_ids):
+            item = self._competition.objects.get(target_id, {})
+            placement = placements.get(target_id, {})
+            target = {"object_id": target_id}
+            for key in ("name", "semantic_type", "category", "type"):
+                value = item.get(key)
+                if value not in (None, "", "Unknown", "unknown"):
+                    target[key] = value
+            if isinstance(placement.get("location"), list):
+                target["location"] = placement["location"]
+            target_options.append(target)
+
+        instruction = (
+            "You are the visual classification stage of a TidyRoom robot. "
+            "Inspect the CURRENT image once and classify EVERY candidate object listed below. "
+            "Do not propose robot actions. Return exactly one JSON object with key 'objects'. "
+            "Each object must contain: object_id, is_clutter (boolean), category "
+            "(one of shoe,cup,bottle,food,trash,pillow,other), confidence (0..1), "
+            "and target_id (one visible target object_id below, or null). "
+            "Clutter means an item the task asks to tidy: cushions/pillows, shoes/boots/slippers, "
+            "trash, food, cups/mugs/bottles. Furniture, walls, floors, fixtures and structural "
+            "objects are not clutter. Use target_id only when the visible target is semantically "
+            "appropriate (shoe->rack/shelf, trash->bin, pillow->sofa/bed, drinkware->table/shelf, "
+            "food->cabinet/fridge/storage). Classify all candidate IDs exactly once.\n"
+            f"Candidate objects: {json.dumps(review_objects, ensure_ascii=False)}\n"
+            f"Visible target surfaces: {json.dumps(target_options, ensure_ascii=False)}"
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Return strict JSON only. This is visual classification, not action planning. "
+                    "Never emit look_at_object or any other action."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_data}},
+                    {"type": "text", "text": instruction},
+                ],
+            },
+        ]
+        self._competition.record_prompt_context(self._strip_image_urls(messages))
+        response = self._invoke_model_with_recovery(messages)
+        if response is None:
+            logger.warning("TidyRoom batch visual review failed; will change view and retry")
+            return []
+
+        token_usage = getattr(response, "token_usage", None)
+        if token_usage:
+            logger.info(
+                "TidyRoom batch review Token Usage: prompt={}, completion={}, total={}",
+                token_usage.get("prompt_tokens", 0),
+                token_usage.get("completion_tokens", 0),
+                token_usage.get("total_tokens", 0),
+            )
+        response_text = getattr(response, "text", None) or ""
+        parsed = extract_last_json_from_text(response_text)
+        if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
+            parsed = parsed[0]
+        raw_reviews = parsed.get("objects", []) if isinstance(parsed, dict) else []
+        if not isinstance(raw_reviews, list):
+            logger.warning("TidyRoom batch review returned malformed JSON: {}", response_text)
+            return []
+
+        requested = set(review_ids)
+        valid_reviews: list[dict[str, Any]] = []
+        allowed_categories = {"shoe", "cup", "bottle", "food", "trash", "pillow", "other"}
+        for raw in raw_reviews:
+            if not isinstance(raw, dict):
+                continue
+            object_id = str(raw.get("object_id") or "")
+            if object_id not in requested or not isinstance(raw.get("is_clutter"), bool):
+                continue
+            category = str(raw.get("category") or "other").strip().lower()
+            if category not in allowed_categories:
+                category = "other"
+            try:
+                confidence = float(raw.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            target_id = raw.get("target_id")
+            target_id = str(target_id) if target_id not in (None, "", "null") else None
+            if target_id not in progress.target_surfaces:
+                target_id = None
+            valid_reviews.append(
+                {
+                    "object_id": object_id,
+                    "is_clutter": raw["is_clutter"],
+                    "category": category,
+                    "confidence": max(0.0, min(confidence, 1.0)),
+                    "target_id": target_id,
+                }
+            )
+
+        progress.apply_vlm_reviews(valid_reviews)
+        reviewed_by_id = {item["object_id"]: item for item in valid_reviews}
+        for object_id, review in reviewed_by_id.items():
+            if review["is_clutter"] and review["confidence"] >= 0.6:
+                item = self._competition.objects.get(object_id)
+                if isinstance(item, dict):
+                    item["vlm_semantic_type"] = review["category"]
+                target_id = review.get("target_id")
+                placement = placements.get(str(target_id), {}) if target_id else {}
+                location = placement.get("location")
+                if target_id and isinstance(location, list):
+                    selected = {
+                        "object_id": str(target_id),
+                        "location": location,
+                        "source": str(placement.get("source") or "placement_candidate"),
+                        "confidence": round(float(review["confidence"]), 3),
+                        "reason": "batch VLM visual review selected a visible semantic target",
+                    }
+                    progress.set_target_assignment(
+                        object_id,
+                        {
+                            "object_id": object_id,
+                            "object_type": review["category"],
+                            "candidate_targets": [selected],
+                            "selected_target": selected,
+                            "confidence": selected["confidence"],
+                            "reason": selected["reason"],
+                        },
+                    )
+
+        logger.info(
+            "TidyRoom batch review: requested={} returned={} clutter={} non_clutter={} unresolved={}",
+            review_ids,
+            sorted(reviewed_by_id),
+            sorted(item["object_id"] for item in valid_reviews if item["is_clutter"]),
+            sorted(item["object_id"] for item in valid_reviews if not item["is_clutter"]),
+            sorted(progress.uncertain_items),
+        )
+        return valid_reviews
+
+    def _tidyroom_progress_action(self) -> dict[str, Any] | None:
+        """Advance camera coverage without returning to free-form per-object planning."""
+        progress = self._competition.progress
+        needs_new_view = bool(
+            progress.uncertain_items
+            or progress.remaining_candidates()
+            or progress.failed_objects
+            or (progress.current_object and progress.selected_target(progress.current_object) is None)
+        )
+        if not needs_new_view:
+            return None
+        degrees = (75.0, 105.0, 135.0, 90.0)
+        step = self._competition.metrics.steps if self._competition.metrics is not None else 0
+        degree = degrees[step % len(degrees)]
+        return {
+            "think": "change view to find new clutter evidence or a semantic placement target",
+            "action": "turn_in_degree",
+            "parameters": {"degree": degree},
+            "output": 0,
+            "expected_change": "next frame exposes different clutter or storage evidence",
+        }
 
     def _invoke_client_once(self, messages: list[dict[str, Any]]) -> ClientResponse:
         if self.vlm_client is None:
