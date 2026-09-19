@@ -16,6 +16,11 @@ from loguru import logger
 from arenaagent.agent_base import AgentBase, AgentCfg, parse_struct_to_data
 from arenaagent.builder import Register
 from arenaagent.competition.runtime import ActionValidation, CompetitionRuntime
+from arenaagent.competition.solvers.tidyroom_policy import (
+    TidyObjectClassification,
+    TidyObjectClassifier,
+    deduplicate_visible_objects,
+)
 from arenaagent.competition.task_router import TaskStrategyRouter
 from arenaagent.tongsim_grpc_client import TongSimGrpcClient
 from arenaagent.tongsim_interface import Rotation, TongSimInterface
@@ -102,6 +107,8 @@ class VLMAgent(AgentBase):
         self._task_router = TaskStrategyRouter(
             counting_scan_degrees=list(getattr(self.cfg, "counting_scan_degrees", [90.0, 180.0, 270.0]))
         )
+        self._tidy_classifier = TidyObjectClassifier()
+        self._tidy_classification = TidyObjectClassification()
 
     def init(self, opt: dict[str, Any]) -> None:
         if self._initialized:
@@ -177,15 +184,18 @@ class VLMAgent(AgentBase):
             return self._recoverable_step_failure("PERCEPTION_ERROR", exc, stage="perception")
         b64_image = perception.get("image")
         self._save_perception_image(b64_image)
-        visible_objects_info = perception.get("objects", [])
-        self._last_visible_objects_info = visible_objects_info or []
+        raw_visible_objects = perception.get("objects", [])
+        visible_objects_info = deduplicate_visible_objects(raw_visible_objects)
+        self._last_visible_objects_info = visible_objects_info
         image_data = self._to_data_url(b64_image)
         self._competition.observe(visible_objects_info, task_response)
 
         logger.debug(
-            "Perception acquired: image size={}, visible objects={}",
+            "Perception acquired: image size={}, raw objects={}, deduplicated objects={}, object_ids={}",
             len(b64_image) if b64_image else 0,
-            visible_objects_info,
+            len(raw_visible_objects) if isinstance(raw_visible_objects, list) else 0,
+            len(visible_objects_info),
+            [str(item.get("object_id")) for item in visible_objects_info],
         )
 
         if self._should_handle_piece_transfer():
@@ -202,6 +212,23 @@ class VLMAgent(AgentBase):
             except Exception as exc:
                 logger.warning(f"获取手中物体失败: {exc}")
         self._competition.update_hand_state(bool(object_in_hand))
+        prompt_visible_objects = visible_objects_info
+        if self._competition.task_type == "tidyroom":
+            self._tidy_classification = self._tidy_classifier.classify(
+                raw_visible_objects,
+                required_ids=set(self._competition.progress.expected_objects),
+                completed_ids=set(self._competition.progress.completed_objects),
+                blacklisted_ids=set(self._competition.progress.failed_objects),
+            )
+            self._competition.progress.update_classification(
+                candidate_items=set(self._tidy_classification.candidate_items),
+                rejected_items=set(self._tidy_classification.rejected_items),
+                uncertain_items=set(self._tidy_classification.uncertain_items),
+            )
+            prompt_visible_objects = self._tidy_classifier.relevant_objects(
+                self._tidy_classification,
+                current_object_id=self._competition.progress.current_object,
+            )
         # Strategy state must be derived after hand/pick/place verification so
         # a failed Jigsaw placement advances its rotation in the same turn.
         self._task_router.observe(self._competition, subject)
@@ -241,7 +268,7 @@ class VLMAgent(AgentBase):
             subject=subject,
             task_response=task_response,
             api_info=api_info,
-            visible_objects_info=visible_objects_info,
+            visible_objects_info=prompt_visible_objects,
             object_in_hand=object_in_hand,
         )
         messages = (
@@ -370,6 +397,7 @@ class VLMAgent(AgentBase):
         self._raven_candidates_cache = {}
         self._raven_decision_cache = {}
         self._raven_next_index = {}
+        self._tidy_classification = TidyObjectClassification()
 
     def _invoke_client_once(self, messages: list[dict[str, Any]]) -> ClientResponse:
         if self.vlm_client is None:

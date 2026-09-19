@@ -83,6 +83,9 @@ class TidyRoomTracker:
     pending_place_mode: str = ""
     completed_goal_actions: int = 0
     completion_evidence: bool = False
+    candidate_items: set[str] = field(default_factory=set)
+    rejected_items: set[str] = field(default_factory=set)
+    uncertain_items: set[str] = field(default_factory=set)
 
     def reset(self, subject: dict[str, Any]) -> None:
         self.expected_objects = _as_ids(subject.get("movable_object_id")) | _as_ids(subject.get("piece_object_id"))
@@ -98,6 +101,23 @@ class TidyRoomTracker:
         self.pending_place_mode = ""
         self.completed_goal_actions = 0
         self.completion_evidence = False
+        self.candidate_items = set()
+        self.rejected_items = set()
+        self.uncertain_items = set()
+
+    def update_classification(
+        self,
+        *,
+        candidate_items: set[str],
+        rejected_items: set[str],
+        uncertain_items: set[str],
+    ) -> None:
+        self.candidate_items.update(candidate_items - self.completed_objects)
+        self.rejected_items.update(rejected_items)
+        self.uncertain_items.update(uncertain_items)
+        self.uncertain_items.difference_update(self.candidate_items | self.rejected_items | self.completed_objects)
+        for object_id in self.candidate_items:
+            self.states.setdefault(object_id, "DISCOVERED")
 
     def observe(self, known_objects: dict[str, dict[str, Any]], completion_evidence: bool = False) -> None:
         self.completion_evidence = self.completion_evidence or bool(completion_evidence)
@@ -234,4 +254,7 @@ class TidyRoomTracker:
             "remaining_objects": sorted(self.expected_objects),
             "completed_goal_actions": self.completed_goal_actions,
             "completion_evidence": self.completion_evidence,
+            "candidate_items": sorted(self.candidate_items - self.completed_objects),
+            "rejected_items": sorted(self.rejected_items),
+            "uncertain_items": sorted(self.uncertain_items),
         }
