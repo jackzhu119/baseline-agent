@@ -20,6 +20,7 @@ from arenaagent.competition.task_router import TaskStrategyRouter
 from arenaagent.tongsim_grpc_client import TongSimGrpcClient
 from arenaagent.tongsim_interface import Rotation, TongSimInterface
 from arenaagent.utils.configclass import configclass
+from arenaagent.utils.redaction import redact_sensitive
 from arenaagent.vlm_agent.client import Client, ClientFactory, ClientResponse
 from arenaagent.vlm_agent.json_parsor import extract_last_json_from_text
 from arenaagent.vlm_agent.prompt import PromptGenerator
@@ -107,7 +108,7 @@ class VLMAgent(AgentBase):
             return
 
         self.cfg.vlm_config.apply_env_overrides()
-        logger.debug("client config {}", self.cfg.vlm_config.client_cfg)
+        logger.debug("client config {}", redact_sensitive(self.cfg.vlm_config.client_cfg))
         self.vlm_client = ClientFactory().build(self.cfg.vlm_config.client_type, self.cfg.vlm_config.client_cfg)
 
         tongsim_server_endpoint = opt.get("tongsim_server_endpoint") or self.cfg.tongsim_server_endpoint

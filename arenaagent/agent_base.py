@@ -6,13 +6,15 @@ from typing import Any, Callable
 import grpc
 from google.protobuf import struct_pb2
 from google.protobuf.json_format import MessageToDict, ParseDict
+from loguru import logger
 
 from arenaagent.generated.arena.agent.arena_agent_service_pb2_grpc import (
     TongTestAgentServiceStub,
 )
 from arenaagent.generated.arena.message import agent_msg_pb2, basic_type_pb2, session_msg_pb2
 from arenaagent.utils.configclass import configclass
-from loguru import logger
+from arenaagent.utils.redaction import redact_sensitive
+
 
 @configclass
 class AgentCfg:
@@ -57,11 +59,15 @@ class AgentBase(ABC):
         raise NotImplementedError("AgentBase.deinit must be implemented by subclasses.")
 
     def load(self, params: dict[str, Any]) -> None:
-        logger.debug(f"params {params}")
+        logger.debug("params {}", redact_sensitive(params))
         try:
             self.cfg.from_dict(params)  # type: ignore[arg-type]
-        except:
-            logger.warning("params format maybe error {} fallback to default config {}", params, self.cfg)
+        except Exception:
+            logger.warning(
+                "params format maybe error {} fallback to default config {}",
+                redact_sensitive(params),
+                redact_sensitive(self.cfg),
+            )
             pass
 
         self.sleep_between_steps = float(self.cfg.sleep_between_steps)
@@ -171,6 +177,7 @@ class AgentBase(ABC):
 
     def _on_subject_evaluated(self, evaluation: dict[str, Any]) -> None:
         """Optional lifecycle hook for metrics/reporting implementations."""
+        return None
 
     def _handle_finish(self, params: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
         self.subject_finished = True
