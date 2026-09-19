@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 DEFAULT_MAX_PROMPT_OBJECTS = 18
+DEFAULT_MAX_VLM_REVIEW_OBJECTS = 10
 _UNKNOWN_VALUES = {"", "unknown", "none", "null", "unlabeled", "unlabelled", "未知"}
 _CLUTTER_TERMS = {
     "shoe",
@@ -146,6 +147,7 @@ class TidyObjectClassification:
     rejected_items: dict[str, str] = field(default_factory=dict)
     uncertain_items: dict[str, str] = field(default_factory=dict)
     target_surfaces: dict[str, dict[str, Any]] = field(default_factory=dict)
+    review_items: dict[str, dict[str, Any]] = field(default_factory=dict)
     raw_count: int = 0
     deduplicated_count: int = 0
 
@@ -155,6 +157,7 @@ class TidyObjectClassification:
             "rejected_items": dict(sorted(self.rejected_items.items())),
             "uncertain_items": dict(sorted(self.uncertain_items.items())),
             "target_surfaces": sorted(self.target_surfaces),
+            "review_items": sorted(self.review_items),
             "raw_count": self.raw_count,
             "deduplicated_count": self.deduplicated_count,
         }
@@ -277,8 +280,13 @@ class TidyTargetPlanner:
 class TidyObjectClassifier:
     """Classify only public perception fields; Unknown is never clutter by default."""
 
-    def __init__(self, max_prompt_objects: int = DEFAULT_MAX_PROMPT_OBJECTS) -> None:
+    def __init__(
+        self,
+        max_prompt_objects: int = DEFAULT_MAX_PROMPT_OBJECTS,
+        max_review_objects: int = DEFAULT_MAX_VLM_REVIEW_OBJECTS,
+    ) -> None:
         self.max_prompt_objects = max(int(max_prompt_objects), 1)
+        self.max_review_objects = max(int(max_review_objects), 1)
 
     def classify(
         self,
@@ -314,11 +322,13 @@ class TidyObjectClassifier:
             normalized = semantic_text.strip().lower()
             if normalized in _UNKNOWN_VALUES or not normalized or "unknown" in _terms(normalized):
                 result.uncertain_items[current_id] = "missing reliable semantic class"
+                result.review_items[current_id] = self._compact(item, "requires VLM visual review")
                 continue
             if _contains_term(semantic_text, _CLUTTER_TERMS):
                 result.candidate_items[current_id] = self._compact(item, "recognized clutter class")
                 continue
             result.uncertain_items[current_id] = "class is not an approved high-confidence clutter type"
+            result.review_items[current_id] = self._compact(item, "requires VLM visual review")
         return result
 
     def relevant_objects(
@@ -335,6 +345,12 @@ class TidyObjectClassifier:
             if current_id_key != current_id:
                 ordered.append(classification.candidate_items[current_id_key])
         ordered.extend(classification.target_surfaces[key] for key in sorted(classification.target_surfaces))
+        review_budget = min(self.max_review_objects, max(self.max_prompt_objects - len(ordered), 0))
+        if review_budget:
+            ordered.extend(
+                classification.review_items[key]
+                for key in sorted(classification.review_items)[:review_budget]
+            )
         return ordered[: self.max_prompt_objects]
 
     @staticmethod
