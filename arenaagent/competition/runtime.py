@@ -769,11 +769,34 @@ class CompetitionRuntime:
             official_object = current_id in self.progress.initial_expected_objects
             if name in {"put_down_sth", "move_and_put_down", "move_and_put_down_object_in_container"}:
                 if selected_target is None and not official_object:
-                    return self._invalid(
-                        normalized,
-                        f"held object {current_id!r} has no high-confidence semantic placement target",
-                        "PLANNING_ERROR",
+                    requested = next(
+                        (
+                            params.get(key)
+                            for key in ("put_target_location", "put_location", "target_location")
+                            if params.get(key) is not None
+                        ),
+                        None,
                     )
+                    requested_position = _object_position({"position": requested}) if _is_location(requested) else None
+                    safe_positions = [
+                        _object_position({"position": item.get("location")})
+                        for item in self.placement_candidates()
+                        if str(item.get("object_id") or "") in self.progress.target_surfaces
+                    ]
+                    safe_positions = [point for point in safe_positions if point is not None]
+                    if (
+                        requested_position is None
+                        or not safe_positions
+                        or min(math.dist(requested_position, point) for point in safe_positions) > 15.0
+                    ):
+                        return self._invalid(
+                            normalized,
+                            (
+                                f"held object {current_id!r} has no deterministic target; "
+                                "VLM placement must match a currently observed semantic target surface"
+                            ),
+                            "PLANNING_ERROR",
+                        )
                 if selected_target is not None and name != "move_and_put_down_object_in_container":
                     requested = next(
                         (
@@ -796,11 +819,36 @@ class CompetitionRuntime:
                             "PLANNING_ERROR",
                         )
             if name in {"move_to_location", "move_to_object"} and selected_target is None and not official_object:
-                return self._invalid(
-                    normalized,
-                    "holding state permits only target-directed movement or observation recovery",
-                    "PLANNING_ERROR",
-                )
+                if name == "move_to_object":
+                    target_raw = str(params.get("object_id") or params.get("object") or "")
+                    target_id = self.object_aliases.get(target_raw, target_raw)
+                    if target_id in self.progress.target_surfaces:
+                        pass
+                    else:
+                        return self._invalid(
+                            normalized,
+                            "holding state permits movement only toward a recognized semantic target surface",
+                            "PLANNING_ERROR",
+                        )
+                else:
+                    requested = params.get("target_location", params.get("location"))
+                    requested_position = _object_position({"position": requested}) if _is_location(requested) else None
+                    safe_positions = [
+                        _object_position({"position": item.get("location")})
+                        for item in self.placement_candidates()
+                        if str(item.get("object_id") or "") in self.progress.target_surfaces
+                    ]
+                    safe_positions = [point for point in safe_positions if point is not None]
+                    if (
+                        requested_position is None
+                        or not safe_positions
+                        or min(math.dist(requested_position, point) for point in safe_positions) > 15.0
+                    ):
+                        return self._invalid(
+                            normalized,
+                            "holding state permits movement only toward a recognized semantic target surface",
+                            "PLANNING_ERROR",
+                        )
         if name in {"submit_answer", "submit_puzzle_answer"} and normalized.get("output") in (None, ""):
             return self._invalid(normalized, "submit_answer requires a non-empty output", "TERMINATION_ERROR")
         if name == "finish_task" and self.task_type in {"counting", "npc", "raven"}:
