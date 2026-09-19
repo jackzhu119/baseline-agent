@@ -114,6 +114,8 @@ class TidyRoomTracker:
     target_surfaces: set[str] = field(default_factory=set)
     target_assignments: dict[str, dict[str, Any]] = field(default_factory=dict)
     object_attempt_registry: dict[str, ObjectAttemptState] = field(default_factory=dict)
+    vlm_reviews: dict[str, dict[str, Any]] = field(default_factory=dict)
+    review_attempts: Counter[str] = field(default_factory=Counter)
     final_scan_count: int = 0
     coverage_verified: bool = False
 
@@ -137,6 +139,8 @@ class TidyRoomTracker:
         self.target_surfaces = set()
         self.target_assignments = {}
         self.object_attempt_registry = {}
+        self.vlm_reviews = {}
+        self.review_attempts = Counter()
         self.final_scan_count = 0
         self.coverage_verified = False
 
@@ -162,6 +166,47 @@ class TidyRoomTracker:
             self.object_attempt_registry.setdefault(object_id, ObjectAttemptState(object_id))
         if newly_discovered:
             self.record_final_scan(discovered_new_candidate=True)
+
+    def apply_vlm_reviews(self, reviews: list[dict[str, Any]], confidence_threshold: float = 0.6) -> None:
+        """Persist batch visual classifications so reviewed IDs are not re-reviewed forever."""
+        for review in reviews:
+            if not isinstance(review, dict):
+                continue
+            object_id = str(review.get("object_id") or "")
+            if not object_id or object_id not in self.uncertain_items:
+                continue
+            is_clutter = review.get("is_clutter")
+            category = str(review.get("category") or "other").strip().lower()
+            try:
+                confidence = float(review.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            confidence = max(0.0, min(confidence, 1.0))
+            self.review_attempts[object_id] += 1
+            stored = {
+                "object_id": object_id,
+                "is_clutter": is_clutter if isinstance(is_clutter, bool) else None,
+                "category": category,
+                "confidence": round(confidence, 3),
+                "target_id": (
+                    str(review.get("target_id"))
+                    if review.get("target_id") not in (None, "", "null")
+                    else None
+                ),
+            }
+            self.vlm_reviews[object_id] = stored
+            if not isinstance(is_clutter, bool) or confidence < confidence_threshold:
+                continue
+            self.uncertain_items.discard(object_id)
+            if is_clutter:
+                self.rejected_items.discard(object_id)
+                self.candidate_items.add(object_id)
+                self.states.setdefault(object_id, "DISCOVERED")
+                self.object_attempt_registry.setdefault(object_id, ObjectAttemptState(object_id))
+                self.record_final_scan(discovered_new_candidate=True)
+            else:
+                self.candidate_items.discard(object_id)
+                self.rejected_items.add(object_id)
 
     def set_target_assignment(self, object_id: str, assignment: dict[str, Any]) -> None:
         self.target_assignments[str(object_id)] = assignment
@@ -365,6 +410,8 @@ class TidyRoomTracker:
             "uncertain_items": sorted(self.uncertain_items),
             "target_surfaces": sorted(self.target_surfaces),
             "target_assignments": dict(sorted(self.target_assignments.items())),
+            "vlm_reviews": dict(sorted(self.vlm_reviews.items())),
+            "review_attempts": dict(sorted(self.review_attempts.items())),
             "object_attempt_registry": {
                 object_id: attempt.context()
                 for object_id, attempt in sorted(self.object_attempt_registry.items())
@@ -382,6 +429,7 @@ class TidyRoomTracker:
         context["rejected_items"] = context["rejected_items"][:5]
         context["uncertain_items"] = context["uncertain_items"][:5]
         context["target_surfaces"] = context["target_surfaces"][:limit]
+        context["vlm_reviews"] = dict(list(context["vlm_reviews"].items())[-limit:])
         relevant_attempts = set(context["candidate_items"]) | self.completed_objects
         context["object_attempt_registry"] = {
             key: value
