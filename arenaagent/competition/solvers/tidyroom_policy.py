@@ -319,6 +319,10 @@ class TidyObjectClassifier:
             if _contains_term(semantic_text, _STATIC_TERMS):
                 result.rejected_items[current_id] = "static geometry or furniture"
                 continue
+            vlm_semantic = str(item.get("vlm_semantic_type") or "").strip().lower()
+            if vlm_semantic and _contains_term(vlm_semantic, _CLUTTER_TERMS):
+                result.candidate_items[current_id] = self._compact(item, "VLM-reviewed clutter class")
+                continue
             normalized = semantic_text.strip().lower()
             if normalized in _UNKNOWN_VALUES or not normalized or "unknown" in _terms(normalized):
                 result.uncertain_items[current_id] = "missing reliable semantic class"
