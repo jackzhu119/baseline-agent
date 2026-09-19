@@ -1,11 +1,13 @@
 
-import sys
 import os
-
-from typing import Any
-from loguru import logger
+import sys
 from datetime import datetime
+from typing import Any
+
 import toml
+from loguru import logger
+
+from arenaagent.utils.redaction import redact_sensitive
 
 CONFIG: dict[str, Any] = {}
 
@@ -44,7 +46,7 @@ def load_config(config_path="config.toml", extra_params: dict | None = None):
     if extra_params:
         CONFIG.update(extra_params)
     logger.info("Loaded config from {}", config_path)
-    logger.info(CONFIG)
+    logger.debug("Loaded config {}", redact_sensitive(CONFIG))
     return config
 
 

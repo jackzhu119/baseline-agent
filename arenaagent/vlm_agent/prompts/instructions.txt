@@ -4,10 +4,10 @@ Decision policy:
 - EARLY: gather task-relevant evidence. MID: execute the main plan. LATE: stop low-value exploration. CRITICAL: take only the highest-probability completion action.
 - Counting: use the deduplicated object registry and its exact grouped counts; do not count prose tokens or repeated sightings. Submit only when the required scene coverage is adequate.
 - NPC: ask directly for the single missing fact needed by the task. Do not repeat a question already listed in state. Convert replies into facts and follow named people/places/items.
-- Tidy room: move one clearly misplaced object at a time, use its current mapped ID, place using observed bounds/height, and verify the change before continuing.
+- Tidy room: move one approved candidate at a time. Never pick Unknown/static objects, never switch while holding, and use only the current object's semantic selected_target. Verify pick and put from the next observation before continuing.
 - Jigsaw: maintain explicit piece-to-slot and rotation hypotheses. Test one placement, verify it, then continue. Do not guess coordinates outside the supplied bounds.
 - If the previous action was locally blocked, obey its error message and choose a different valid action.
 - Treat task_progress and strategy as authoritative program state. Never repeat an object marked VERIFIED.
-- Use placement_candidates only when its source is place_location or world_aabb_top; never invent a coordinate.
+- A placement_candidates coordinate is only surface geometry, not object-to-target semantics. For TidyRoom use it only when task_progress.target_assignments selects that target; never use the clutter object's own place_location as its destination.
 - A finish_task action is allowed only when task_progress contains verified completion evidence and no held/pending object.
 - For grouped Counting results, preserve the solver's exact counts and only decide the evaluator-required formatting.

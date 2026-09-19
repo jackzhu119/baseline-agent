@@ -774,11 +774,29 @@ class CompetitionRuntime:
             if not allowed:
                 return self._invalid(normalized, f"finish blocked: {reason}", "PREMATURE_FINISH")
 
-        if name == "move_and_take_object":
-            if self.progress.pending_place:
+        if self.task_type == "tidyroom" and self._elapsed_seconds() >= 340:
+            critical_allowed = {
+                "move_and_take_object",
+                "put_down_sth",
+                "move_and_put_down",
+                "move_and_put_down_object_in_container",
+                "finish_task",
+            }
+            final_scan_allowed = name == "turn_in_degree" and self.progress.final_scan_count <= 2
+            if name not in critical_allowed and not final_scan_allowed:
                 return self._invalid(
                     normalized,
-                    f"placement of {self.progress.pending_place!r} is awaiting observation verification",
+                    "critical time phase blocks low-value exploration",
+                    "TIME_BUDGET",
+                )
+
+        if name == "move_and_take_object":
+            if self.task_type == "tidyroom" and (
+                object_in_hand or self.progress.current_object or self.progress.pending_pick or self.progress.pending_place
+            ):
+                return self._invalid(
+                    normalized,
+                    "strict tidy-room loop blocks a new pickup while another object is held or awaiting verification",
                     "PLANNING_ERROR",
                 )
             object_id = next(
@@ -791,6 +809,17 @@ class CompetitionRuntime:
                     f"object {object_id!r} is already verified complete",
                     "PLANNING_ERROR",
                 )
+            if self.task_type == "tidyroom":
+                allowed_ids = self.progress.candidate_items | self.progress.initial_expected_objects
+                if canonical_id not in allowed_ids:
+                    return self._invalid(
+                        normalized,
+                        f"object {object_id!r} is not approved as high-confidence clutter",
+                        "PLANNING_ERROR",
+                    )
+                can_attempt, reason = self.progress.can_attempt_pick(canonical_id, self.metrics.steps)
+                if not can_attempt:
+                    return self._invalid(normalized, reason, "LOOP_ERROR")
 
         if name in {"move_to_npc", "speak_to_npc"}:
             target = str(next((params[key] for key in ("npc_name", "npc", "target", "name") if params.get(key)), ""))
@@ -815,7 +844,7 @@ class CompetitionRuntime:
                     "NPC_BAD_QUESTION",
                 )
 
-        signature = self.action_signature(normalized)
+        signature = self.semantic_action_signature(normalized)
         # solve_raven advances through a cached ranked candidate list internally,
         # so a few identical public actions are distinct attempts, but retries
         # are still bounded to avoid an endless candidate loop.
@@ -860,11 +889,65 @@ class CompetitionRuntime:
         }
         return _hash(payload)
 
+    def semantic_action_signature(self, action: dict[str, Any]) -> str:
+        """Collapse JSON variations that pursue the same physical target."""
+        name = str(action.get("action") or "").lower()
+        params = action.get("parameters") or {}
+        if name in {"move_and_take_object", "move_to_object", "look_at_object"}:
+            raw_id = str(params.get("object_id") or params.get("object") or "")
+            canonical_id = self.object_aliases.get(raw_id, raw_id)
+            verb = "pick" if name == "move_and_take_object" else "move_target" if name == "move_to_object" else "look"
+            return _hash({"semantic_action": verb, "target": canonical_id})
+        if name == "move_to_location":
+            location = params.get("target_location", params.get("location"))
+            if _is_location(location):
+                point = _object_position({"position": location})
+                nearby: list[tuple[float, str]] = []
+                if point is not None:
+                    for canonical_id in self.visible_canonical_ids:
+                        object_position = _object_position(self.objects.get(canonical_id, {}))
+                        if object_position is not None and math.dist(point, object_position) <= 5.0:
+                            nearby.append((math.dist(point, object_position), canonical_id))
+                if nearby:
+                    nearby.sort()
+                    return _hash({"semantic_action": "move_target", "target": nearby[0][1]})
+        if name in {"put_down_sth", "move_and_put_down"}:
+            location = next(
+                (
+                    params.get(key)
+                    for key in ("put_target_location", "put_location", "target_location")
+                    if params.get(key) is not None
+                ),
+                None,
+            )
+            point = _object_position({"position": location}) if _is_location(location) else None
+            if point is not None:
+                return _hash({"semantic_action": "put", "target_cell": [round(value / 5) for value in point]})
+        return self.action_signature(action)
+
+    def action_value_score(self, action: dict[str, Any]) -> float:
+        """Score whether an action advances the current TidyRoom subgoal."""
+        name = str(action.get("action") or "").lower()
+        if name in {"finish_task", "move_and_take_object", "put_down_sth", "move_and_put_down"}:
+            return 1.0
+        if name == "move_to_location" and self.progress.current_object:
+            return 0.8
+        if name in {"look_at_object", "look_at_location"}:
+            return 0.6
+        if name == "turn_in_degree" and self.progress.final_scan_count <= 2:
+            return 0.5
+        if name == "move_to_object":
+            return 0.4
+        return 0.0
+
+    def _elapsed_seconds(self) -> float:
+        return max(time.perf_counter() - self._started_monotonic, 0.0)
+
     def record_action(self, action: dict[str, Any], result: Any, *, validation: ActionValidation | None = None) -> None:
         if self.metrics is None:
             return
         self.metrics.steps += 1
-        signature = self.action_signature(action)
+        signature = self.semantic_action_signature(action)
         failed = validation is not None and not validation.valid or _result_failed(result)
         if failed:
             self.failed_signatures[signature] += 1
@@ -884,7 +967,7 @@ class CompetitionRuntime:
         canonical_object_id = (
             self.object_aliases.get(raw_object_id, raw_object_id) or self.progress.current_object or ""
         )
-        self.progress.record_action(action, result, canonical_object_id)
+        self.progress.record_action(action, result, canonical_object_id, self.metrics.steps)
         if not failed:
             self._record_postcondition_events(
                 self.postconditions.start(
@@ -906,6 +989,7 @@ class CompetitionRuntime:
                 "signature": signature,
                 "state": self._state_snapshot(),
                 "action": _canonical(action),
+                "action_value_score": self.action_value_score(action) if self.task_type == "tidyroom" else None,
                 "result": _canonical(result),
                 "failed": bool(failed),
                 "postcondition": (
@@ -949,7 +1033,7 @@ class CompetitionRuntime:
             return {}
         remaining = max(self.max_steps - self.metrics.steps, 0)
         ratio = remaining / self.max_steps
-        phase = (
+        step_phase = (
             "EARLY"
             if ratio > EARLY_PHASE_RATIO
             else "MID"
@@ -958,6 +1042,18 @@ class CompetitionRuntime:
             if remaining > CRITICAL_REMAINING_STEPS
             else "CRITICAL"
         )
+        elapsed_seconds = self._elapsed_seconds()
+        time_phase = (
+            "EARLY"
+            if elapsed_seconds < 120
+            else "MID"
+            if elapsed_seconds < 250
+            else "LATE"
+            if elapsed_seconds < 340
+            else "CRITICAL"
+        )
+        phase_order = {"EARLY": 0, "MID": 1, "LATE": 2, "CRITICAL": 3}
+        phase = max((step_phase, time_phase), key=phase_order.__getitem__)
         blocked_failed_actions = sum(
             1 for count in self.failed_signatures.values() if count >= self.repeated_action_limit
         )
@@ -974,12 +1070,28 @@ class CompetitionRuntime:
                 and self.postconditions.history[-1].status in {POSTCONDITION_FAILURE, POSTCONDITION_UNKNOWN}
             )
         )
+        placement_candidates = self._placement_candidates()
+        visible_ids = sorted(self.visible_object_ids)
+        task_progress = self.progress.context()
+        if self.task_type == "tidyroom":
+            relevant_ids = (
+                self.progress.remaining_candidates()
+                | self.progress.target_surfaces
+                | ({self.progress.current_object} if self.progress.current_object else set())
+            )
+            visible_ids = [object_id for object_id in visible_ids if object_id in relevant_ids][:24]
+            if self.progress.target_surfaces:
+                placement_candidates = [
+                    item for item in placement_candidates if str(item.get("object_id")) in self.progress.target_surfaces
+                ][:18]
+            task_progress = self.progress.prompt_context()
         return {
             "task_type": self.task_type,
             "step_budget": {
                 "current_step": self.metrics.steps,
                 "max_steps": self.max_steps,
                 "remaining_steps": remaining,
+                "elapsed_seconds": round(elapsed_seconds, 1),
                 "phase": phase,
                 "policy": {
                     "exploration_allowed": phase in {"EARLY", "MID"},
@@ -987,7 +1099,7 @@ class CompetitionRuntime:
                     "retry_limit": 0 if phase == "CRITICAL" else 1 if phase == "LATE" else self.repeated_action_limit,
                 },
             },
-            "visible_object_ids": sorted(self.visible_object_ids),
+            "visible_object_ids": visible_ids,
             "observation_diff": self.last_observation_diff,
             "object_registry": {
                 "unique_objects_seen": len(self.objects),
@@ -1010,10 +1122,13 @@ class CompetitionRuntime:
                 ),
             },
             "strategy": self.strategy_context,
-            "task_progress": self.progress.context(),
+            "task_progress": task_progress,
             "action_postconditions": self.postconditions.context(),
-            "placement_candidates": self._placement_candidates(),
+            "placement_candidates": placement_candidates,
         }
+
+    def placement_candidates(self) -> list[dict[str, Any]]:
+        return self._placement_candidates()
 
     def _placement_candidates(self) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []

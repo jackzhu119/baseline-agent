@@ -7,6 +7,8 @@ from typing import Any
 
 PLACEMENT_TOLERANCE = 15.0
 VECTOR_DIMENSIONS = 3
+MAX_PICK_ATTEMPTS = 2
+MAX_FINAL_SCANS = 2
 
 
 def _as_ids(value: Any) -> set[str]:
@@ -68,6 +70,29 @@ def _object_position(item: dict[str, Any]) -> list[float] | None:
 
 
 @dataclass(slots=True)
+class ObjectAttemptState:
+    object_id: str
+    pick_attempts: int = 0
+    put_attempts: int = 0
+    last_action: str = ""
+    last_result: str = ""
+    completed: bool = False
+    failed: bool = False
+    cooldown_until_step: int = 0
+
+    def context(self) -> dict[str, Any]:
+        return {
+            "pick_attempts": self.pick_attempts,
+            "put_attempts": self.put_attempts,
+            "last_action": self.last_action,
+            "last_result": self.last_result,
+            "completed": self.completed,
+            "failed": self.failed,
+            "cooldown_until_step": self.cooldown_until_step,
+        }
+
+
+@dataclass(slots=True)
 class TidyRoomTracker:
     retry_limit: int = 2
     initial_expected_objects: set[str] = field(default_factory=set)
@@ -83,6 +108,14 @@ class TidyRoomTracker:
     pending_place_mode: str = ""
     completed_goal_actions: int = 0
     completion_evidence: bool = False
+    candidate_items: set[str] = field(default_factory=set)
+    rejected_items: set[str] = field(default_factory=set)
+    uncertain_items: set[str] = field(default_factory=set)
+    target_surfaces: set[str] = field(default_factory=set)
+    target_assignments: dict[str, dict[str, Any]] = field(default_factory=dict)
+    object_attempt_registry: dict[str, ObjectAttemptState] = field(default_factory=dict)
+    final_scan_count: int = 0
+    coverage_verified: bool = False
 
     def reset(self, subject: dict[str, Any]) -> None:
         self.expected_objects = _as_ids(subject.get("movable_object_id")) | _as_ids(subject.get("piece_object_id"))
@@ -98,6 +131,64 @@ class TidyRoomTracker:
         self.pending_place_mode = ""
         self.completed_goal_actions = 0
         self.completion_evidence = False
+        self.candidate_items = set()
+        self.rejected_items = set()
+        self.uncertain_items = set()
+        self.target_surfaces = set()
+        self.target_assignments = {}
+        self.object_attempt_registry = {}
+        self.final_scan_count = 0
+        self.coverage_verified = False
+
+    def update_classification(
+        self,
+        *,
+        candidate_items: set[str],
+        rejected_items: set[str],
+        uncertain_items: set[str],
+        target_surfaces: set[str] | None = None,
+    ) -> None:
+        newly_discovered = candidate_items - self.candidate_items - self.completed_objects
+        self.candidate_items.update(candidate_items - self.completed_objects)
+        self.rejected_items.update(rejected_items)
+        self.uncertain_items.update(uncertain_items)
+        self.uncertain_items.difference_update(self.candidate_items | self.rejected_items | self.completed_objects)
+        self.target_surfaces.update(target_surfaces or set())
+        for object_id in self.candidate_items:
+            self.states.setdefault(object_id, "DISCOVERED")
+            self.object_attempt_registry.setdefault(object_id, ObjectAttemptState(object_id))
+        if newly_discovered:
+            self.record_final_scan(discovered_new_candidate=True)
+
+    def set_target_assignment(self, object_id: str, assignment: dict[str, Any]) -> None:
+        self.target_assignments[str(object_id)] = assignment
+
+    def selected_target(self, object_id: str) -> dict[str, Any] | None:
+        assignment = self.target_assignments.get(str(object_id), {})
+        selected = assignment.get("selected_target")
+        return selected if isinstance(selected, dict) else None
+
+    def remaining_candidates(self) -> set[str]:
+        return self.candidate_items - self.completed_objects - self.failed_objects
+
+    def can_attempt_pick(self, object_id: str, step: int = 0) -> tuple[bool, str]:
+        attempt = self.object_attempt_registry.setdefault(str(object_id), ObjectAttemptState(str(object_id)))
+        if attempt.completed:
+            return False, "object is already verified complete"
+        if attempt.failed or attempt.pick_attempts >= MAX_PICK_ATTEMPTS:
+            return False, "object exhausted its normal and recovery pickup attempts"
+        if step < attempt.cooldown_until_step:
+            return False, f"object is in cooldown until step {attempt.cooldown_until_step}"
+        return True, "pickup attempt is available"
+
+    def record_final_scan(self, discovered_new_candidate: bool = False) -> None:
+        if discovered_new_candidate:
+            self.final_scan_count = 0
+            self.coverage_verified = False
+            return
+        self.final_scan_count += 1
+        if self.final_scan_count >= MAX_FINAL_SCANS:
+            self.coverage_verified = True
 
     def observe(self, known_objects: dict[str, dict[str, Any]], completion_evidence: bool = False) -> None:
         self.completion_evidence = self.completion_evidence or bool(completion_evidence)
@@ -119,13 +210,14 @@ class TidyRoomTracker:
                 self.current_object = object_id
                 self.states[object_id] = "PICKED"
             else:
-                self._record_failure(object_id)
+                self.current_object = None
+                self._record_failure(object_id, observation_step or 0)
         if self.pending_place is not None:
             object_id = self.pending_place
             if has_object:
                 self._clear_pending_place()
                 self.states[object_id] = "PICKED"
-                self._record_failure(object_id)
+                self._record_failure(object_id, observation_step or 0)
                 return
 
             self.current_object = None
@@ -143,14 +235,30 @@ class TidyRoomTracker:
                 self._verify_placement(object_id)
             else:
                 self._clear_pending_place()
-                self._record_failure(object_id)
+                self._record_failure(object_id, observation_step or 0)
 
-    def record_action(self, action: dict[str, Any], result: Any, canonical_object_id: str = "") -> None:
+    def record_action(
+        self,
+        action: dict[str, Any],
+        result: Any,
+        canonical_object_id: str = "",
+        step: int = 0,
+    ) -> None:
         name = str(action.get("action") or "").lower()
         object_id = canonical_object_id or self.current_object or ""
+        attempt = (
+            self.object_attempt_registry.setdefault(object_id, ObjectAttemptState(object_id)) if object_id else None
+        )
+        if attempt is not None:
+            attempt.last_action = name
+            attempt.last_result = "failure" if _failed(result) else "success"
+            if name == "move_and_take_object":
+                attempt.pick_attempts += 1
+            elif name in {"put_down_sth", "move_and_put_down", "move_and_put_down_object_in_container"}:
+                attempt.put_attempts += 1
         if _failed(result):
             if object_id:
-                self._record_failure(object_id)
+                self._record_failure(object_id, step)
             return
         if name in {"move_to_object", "look_at_object"} and object_id:
             self.states[object_id] = "APPROACHING"
@@ -179,11 +287,14 @@ class TidyRoomTracker:
         }:
             self.completed_goal_actions += 1
 
-    def _record_failure(self, object_id: str) -> None:
+    def _record_failure(self, object_id: str, step: int = 0) -> None:
         self.retries[object_id] += 1
         self.states[object_id] = "DISCOVERED"
-        if self.retries[object_id] > self.retry_limit:
+        attempt = self.object_attempt_registry.setdefault(object_id, ObjectAttemptState(object_id))
+        attempt.cooldown_until_step = max(attempt.cooldown_until_step, step + 2)
+        if self.retries[object_id] >= self.retry_limit or attempt.pick_attempts >= MAX_PICK_ATTEMPTS:
             self.failed_objects.add(object_id)
+            attempt.failed = True
 
     @staticmethod
     def _placement_target(action: dict[str, Any]) -> list[float] | None:
@@ -198,6 +309,9 @@ class TidyRoomTracker:
         self.completed_objects.add(object_id)
         self.expected_objects.discard(object_id)
         self.states[object_id] = "VERIFIED"
+        attempt = self.object_attempt_registry.setdefault(object_id, ObjectAttemptState(object_id))
+        attempt.completed = True
+        attempt.failed = False
         self._clear_pending_place()
 
     def _clear_pending_place(self) -> None:
@@ -217,6 +331,13 @@ class TidyRoomTracker:
             return False, f"official objects lack verified completion: {sorted(unverified)}"
         if self.initial_expected_objects:
             return True, "all official objects have observation-verified completion"
+        unresolved = self.remaining_candidates()
+        if unresolved:
+            return False, f"high-confidence clutter remains unresolved: {sorted(unresolved)}"
+        if self.failed_objects:
+            return False, f"failed clutter remains unresolved: {sorted(self.failed_objects)}"
+        if self.coverage_verified:
+            return True, "bounded final scans found no high-confidence clutter"
         return False, "task coverage is unknown and no official completion evidence exists"
 
     def context(self) -> dict[str, Any]:
@@ -234,4 +355,37 @@ class TidyRoomTracker:
             "remaining_objects": sorted(self.expected_objects),
             "completed_goal_actions": self.completed_goal_actions,
             "completion_evidence": self.completion_evidence,
+            "candidate_items": sorted(self.candidate_items - self.completed_objects),
+            "rejected_items": sorted(self.rejected_items),
+            "uncertain_items": sorted(self.uncertain_items),
+            "target_surfaces": sorted(self.target_surfaces),
+            "target_assignments": dict(sorted(self.target_assignments.items())),
+            "object_attempt_registry": {
+                object_id: attempt.context()
+                for object_id, attempt in sorted(self.object_attempt_registry.items())
+            },
+            "final_scan_count": self.final_scan_count,
+            "coverage_verified": self.coverage_verified,
         }
+
+    def prompt_context(self, limit: int = 18) -> dict[str, Any]:
+        """Bound the model-facing state while retaining all control facts."""
+        context = self.context()
+        context["candidate_items"] = context["candidate_items"][:limit]
+        context["rejected_count"] = len(self.rejected_items)
+        context["uncertain_count"] = len(self.uncertain_items)
+        context["rejected_items"] = context["rejected_items"][:5]
+        context["uncertain_items"] = context["uncertain_items"][:5]
+        context["target_surfaces"] = context["target_surfaces"][:limit]
+        relevant_attempts = set(context["candidate_items"]) | self.completed_objects
+        context["object_attempt_registry"] = {
+            key: value
+            for key, value in context["object_attempt_registry"].items()
+            if key in relevant_attempts
+        }
+        context["target_assignments"] = {
+            key: value
+            for key, value in context["target_assignments"].items()
+            if key in relevant_attempts
+        }
+        return context

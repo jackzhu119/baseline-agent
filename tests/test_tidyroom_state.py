@@ -182,6 +182,56 @@ class TidyRoomStateTests(unittest.TestCase):
         self.assertFalse(decision.valid)
         self.assertEqual(decision.failure_class, "PLANNING_ERROR")
 
+    def test_holding_object_blocks_pick_of_new_object(self) -> None:
+        runtime = CompetitionRuntime(repeated_action_limit=2)
+        runtime.ensure_episode(
+            {"task_type": "tidyroom", "subject": "整理房间", "movable_object_id": ["7", "8"]}
+        )
+        runtime.observe([{"object_id": "7", "name": "cup"}, {"object_id": "8", "name": "shoe"}])
+        runtime.record_action(
+            {"action": "move_and_take_object", "parameters": {"object_id": "7"}},
+            {"result": "success"},
+        )
+        runtime.update_hand_state(True)
+
+        decision = runtime.validate_action(
+            {"action": "move_and_take_object", "parameters": {"object_id": "8"}}, object_in_hand=True
+        )
+
+        self.assertFalse(decision.valid)
+        self.assertEqual(decision.failure_class, "PLANNING_ERROR")
+
+    def test_same_object_pick_is_limited_to_normal_and_recovery_attempt(self) -> None:
+        runtime = self.make_runtime()
+        pick = {"action": "move_and_take_object", "parameters": {"object_id": "7"}}
+        first = runtime.validate_action(pick)
+        self.assertTrue(first.valid)
+        runtime.record_action(pick, {"result": "success"}, validation=first)
+        runtime.update_hand_state(False)
+        runtime.metrics.steps = 3
+        second = runtime.validate_action(pick)
+        self.assertTrue(second.valid)
+        runtime.record_action(pick, {"result": "success"}, validation=second)
+        runtime.update_hand_state(False)
+
+        third = runtime.validate_action(pick)
+
+        self.assertFalse(third.valid)
+        self.assertEqual(third.failure_class, "LOOP_ERROR")
+
+    def test_semantically_equivalent_move_targets_trigger_repeat_guard(self) -> None:
+        runtime = self.make_runtime()
+        runtime.observe([{"object_id": "7", "name": "cup", "position": [1, 2, 3]}])
+        first = {"action": "move_to_object", "parameters": {"object_id": "7"}, "think": "a"}
+        second = {"action": "move_to_location", "parameters": {"target_location": [1, 2, 3]}, "think": "b"}
+        runtime.record_action(first, {"result": "success"})
+        runtime.record_action(second, {"result": "success"})
+
+        decision = runtime.validate_action(first)
+
+        self.assertFalse(decision.valid)
+        self.assertEqual(decision.failure_class, "LOOP_ERROR")
+
 
 if __name__ == "__main__":
     unittest.main()
