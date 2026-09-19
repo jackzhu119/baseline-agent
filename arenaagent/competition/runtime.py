@@ -848,11 +848,15 @@ class CompetitionRuntime:
                     "PLANNING_ERROR",
                 )
             if self.task_type == "tidyroom":
-                allowed_ids = self.progress.candidate_items | self.progress.initial_expected_objects
+                allowed_ids = (
+                    self.progress.candidate_items
+                    | self.progress.initial_expected_objects
+                    | self.progress.uncertain_items
+                )
                 if canonical_id not in allowed_ids:
                     return self._invalid(
                         normalized,
-                        f"object {object_id!r} is not approved as high-confidence clutter",
+                        f"object {object_id!r} is neither approved clutter nor a current VLM-review candidate",
                         "PLANNING_ERROR",
                     )
                 can_attempt, reason = self.progress.can_attempt_pick(canonical_id, self.metrics.steps)
