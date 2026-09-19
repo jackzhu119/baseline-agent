@@ -393,5 +393,30 @@ class TidyRoomStateTests(unittest.TestCase):
         self.assertNotIn("u1", classification.uncertain_items)
 
 
+    def test_non_pickable_tongsim_error_demotes_false_positive(self) -> None:
+        runtime = CompetitionRuntime()
+        runtime.ensure_episode({"task_type": "tidyroom", "subject": "整理房间"})
+        runtime.observe([{"object_id": "u1", "vlm_semantic_type": "shoe"}])
+        runtime.progress.update_classification(
+            candidate_items={"u1"},
+            rejected_items=set(),
+            uncertain_items=set(),
+        )
+        pick = runtime.validate_action(
+            {"action": "move_and_take_object", "parameters": {"object_id": "u1", "which_hand": 0}}
+        )
+        self.assertTrue(pick.valid)
+        runtime.record_action(
+            pick.action,
+            {"result": "failed", "error": "can not take this object for not pickup"},
+            validation=pick,
+        )
+
+        self.assertNotIn("u1", runtime.progress.candidate_items)
+        self.assertNotIn("u1", runtime.progress.failed_objects)
+        self.assertIn("u1", runtime.progress.rejected_items)
+        self.assertEqual(runtime.progress.states["u1"], "REJECTED_NON_PICKABLE")
+
+
 if __name__ == "__main__":
     unittest.main()
