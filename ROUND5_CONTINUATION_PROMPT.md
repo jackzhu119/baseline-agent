@@ -9,6 +9,7 @@
 - Round 4 起点：`2e391e52b9a6d84ea0c639ec678d6e0bd3d4d4d4`
 - Round 4 功能完成提交：`9c90974fbcc0cac37d93450a588fcf18ea621aad`
 - Round 4 报告提交：`f4f456cd49408a3ff532d2a338beb3cfdc81a740`
+- `submit_answer` 生命周期修复提交：`8527700`（以仓库完整提交记录为准）
 
 接手者必须从 `jackzhu119/baseline-agent` 的最新 `main` 继续，不要重新克隆旧上游后从零实现。开始时运行 `git rev-parse HEAD`，以实际最新 SHA 为准。
 
@@ -65,6 +66,7 @@
 
 - 上游基线：76 tests passed。
 - Round 4：109 tests passed、compileall PASS、公开轨迹 replay PASS。
+- 后续生命周期修复：111 tests passed；`submit_answer` 提交后立即退出本地 subject 循环并调用 `evaluate_subject`，不再依赖服务端 15 秒 fallback。
 - 新增 preflight、官方 episode benchmark、failure analyzer、model matrix 和换机指南。
 - 真实 TongSIM 未运行：50051/50060 不可达、无模型凭据、未提供 official release，所以真实分数提升为 `NOT VERIFIED`。
 
@@ -76,6 +78,7 @@
 - `benchmark/round4_preflight.json`
 - `benchmark/round4_replay.json`
 - `docs/ROUND4_WINDOWS_HANDOFF_GUIDE.md`
+- `15_SECOND_TIMEOUT_ANALYSIS.md`
 
 ## 当前最需要下一轮解决的三件事
 
@@ -119,13 +122,14 @@ benchmark/round4_before.json
 benchmark/round4_after.json
 benchmark/round4_preflight.json
 benchmark/round4_replay.json
+15_SECOND_TIMEOUT_ANALYSIS.md
 arenaagent/competition/
 arenaagent/vlm_agent/vlm_agent.py
 arenaagent/vlm_agent/raven_skill.py
 tests/
 scripts/
 
-不要重写已经存在的 NPC information-gain planner、ActionExpectation、Counting boolean filters、Raven rule verifier、Jigsaw global assignment、Tidyroom confidence、bounded model recovery 或 FinishGuard。只有真实失败证据证明有缺陷时才修改。
+不要重写已经存在的 NPC information-gain planner、ActionExpectation、Counting boolean filters、Raven rule verifier、Jigsaw global assignment、Tidyroom confidence、bounded model recovery、FinishGuard 或 `submit_answer → evaluate_subject` 生命周期修复。只有真实失败证据证明有缺陷时才修改。
 
 三、先复现当前状态
 
@@ -138,7 +142,7 @@ uv run --python 3.12.14 python -m pytest -q
 uv run --python 3.12.14 python -m compileall -q arenaagent scripts tests
 uv run --python 3.12.14 python scripts/replay_episode.py examples/public_trace_example.json
 
-当前预期是 109 tests passed、compileall PASS、offline replay PASS。若不同，先定位原因，不要继续叠功能。
+当前预期是 111 tests passed、compileall PASS、offline replay PASS。若不同，先定位原因，不要继续叠功能。
 
 四、最高优先级是真实评测闭环
 
@@ -184,4 +188,3 @@ uv run --python 3.12.14 python scripts/preflight.py --release-dir "实际 releas
 ## 接手者停止条件
 
 如果没有真实服务、模型凭据或官方回合，不能把更多离线规则包装成“排行榜提升”。此时应交付可复现回归、明确的 `NOT VERIFIED`，并列出需要在比赛电脑执行的最小命令和数据需求。
-

@@ -74,3 +74,6 @@ Round 4 的换机安装、环境验收、真实评测与结果打包步骤见
 
 下一位开发者继续 Round 5 时，请直接使用
 [ROUND5_CONTINUATION_PROMPT.md](ROUND5_CONTINUATION_PROMPT.md)，其中列出了相对上游的增量、当前未验证项和可复制的后续优化指令。
+
+每题结束后额外等待 15 秒的客户端生命周期分析及修复证据见
+[15_SECOND_TIMEOUT_ANALYSIS.md](15_SECOND_TIMEOUT_ANALYSIS.md)。
