@@ -560,7 +560,7 @@ class VLMAgent(AgentBase):
         progress.apply_vlm_reviews(valid_reviews)
         reviewed_by_id = {item["object_id"]: item for item in valid_reviews}
         for object_id, review in reviewed_by_id.items():
-            if review["is_clutter"] and review["confidence"] >= 0.6:
+            if review["is_clutter"] and review["confidence"] >= 0.6 and review["category"] != "other":
                 item = self._competition.objects.get(object_id)
                 if isinstance(item, dict):
                     item["vlm_semantic_type"] = review["category"]
