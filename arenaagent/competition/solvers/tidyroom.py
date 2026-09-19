@@ -305,6 +305,24 @@ class TidyRoomTracker:
             elif name in {"put_down_sth", "move_and_put_down", "move_and_put_down_object_in_container"}:
                 attempt.put_attempts += 1
         if _failed(result):
+            if object_id and name == "move_and_take_object":
+                error_text = (
+                    str(result.get("error") or result.get("message") or "").lower()
+                    if isinstance(result, dict)
+                    else ""
+                )
+                if "not pickup" in error_text or "cannot take" in error_text or "can not take" in error_text:
+                    # Real TongSIM uses this error for scene objects that are not
+                    # physically pickable.  Treat it as negative object evidence
+                    # instead of poisoning the episode with an unresolved failure.
+                    self.candidate_items.discard(object_id)
+                    self.uncertain_items.discard(object_id)
+                    self.failed_objects.discard(object_id)
+                    self.rejected_items.add(object_id)
+                    self.states[object_id] = "REJECTED_NON_PICKABLE"
+                    if attempt is not None:
+                        attempt.failed = True
+                    return
             if object_id:
                 self._record_failure(object_id, step)
             return
