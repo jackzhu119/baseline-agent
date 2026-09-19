@@ -197,6 +197,10 @@ class TidyRoomTracker:
             self.vlm_reviews[object_id] = stored
             if not isinstance(is_clutter, bool) or confidence < confidence_threshold:
                 continue
+            # "clutter + other" is not actionable enough to pick safely; keep it
+            # unresolved so another viewpoint/model pass can name a task category.
+            if is_clutter and category == "other":
+                continue
             self.uncertain_items.discard(object_id)
             if is_clutter:
                 self.rejected_items.discard(object_id)
