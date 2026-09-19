@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 DEFAULT_MAX_PROMPT_OBJECTS = 18
-DEFAULT_MAX_VLM_REVIEW_OBJECTS = 10
+DEFAULT_MAX_VLM_REVIEW_OBJECTS = 12
 _UNKNOWN_VALUES = {"", "unknown", "none", "null", "unlabeled", "unlabelled", "未知"}
 _CLUTTER_TERMS = {
     "shoe",
@@ -97,8 +97,8 @@ _TARGET_TERMS = {
     "收纳",
     "区域",
 }
-_SEMANTIC_FIELDS = ("name", "semantic_type", "category", "type", "class", "label", "description")
-_COMPACT_FIELDS = ("name", "semantic_type", "category", "type", "color", "shape", "position")
+_SEMANTIC_FIELDS = ("name", "semantic_type", "vlm_semantic_type", "category", "type", "class", "label", "description")
+_COMPACT_FIELDS = ("name", "semantic_type", "vlm_semantic_type", "category", "type", "color", "shape", "position")
 
 
 def object_id(item: Any) -> str:
@@ -318,6 +318,10 @@ class TidyObjectClassifier:
                 result.target_surfaces[current_id] = self._compact(item, "semantic target surface")
             if _contains_term(semantic_text, _STATIC_TERMS):
                 result.rejected_items[current_id] = "static geometry or furniture"
+                continue
+            vlm_semantic = str(item.get("vlm_semantic_type") or "").strip().lower()
+            if vlm_semantic and _contains_term(vlm_semantic, _CLUTTER_TERMS):
+                result.candidate_items[current_id] = self._compact(item, "VLM-reviewed clutter class")
                 continue
             normalized = semantic_text.strip().lower()
             if normalized in _UNKNOWN_VALUES or not normalized or "unknown" in _terms(normalized):

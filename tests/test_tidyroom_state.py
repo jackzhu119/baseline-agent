@@ -342,5 +342,81 @@ class TidyRoomStateTests(unittest.TestCase):
         self.assertEqual(unsafe.failure_class, "PLANNING_ERROR")
 
 
+    def test_batch_vlm_review_promotes_and_rejects_without_repeating(self) -> None:
+        runtime = CompetitionRuntime()
+        runtime.ensure_episode({"task_type": "tidyroom", "subject": "整理房间"})
+        runtime.progress.update_classification(
+            candidate_items=set(),
+            rejected_items=set(),
+            uncertain_items={"u1", "u2"},
+        )
+        runtime.progress.apply_vlm_reviews(
+            [
+                {
+                    "object_id": "u1",
+                    "is_clutter": True,
+                    "category": "shoe",
+                    "confidence": 0.95,
+                    "target_id": "rack",
+                },
+                {
+                    "object_id": "u2",
+                    "is_clutter": False,
+                    "category": "other",
+                    "confidence": 0.98,
+                    "target_id": None,
+                },
+            ]
+        )
+
+        self.assertIn("u1", runtime.progress.candidate_items)
+        self.assertIn("u2", runtime.progress.rejected_items)
+        self.assertNotIn("u1", runtime.progress.uncertain_items)
+        self.assertNotIn("u2", runtime.progress.uncertain_items)
+
+        # A later raw frame may still say Unknown. Persisted VLM verdicts must
+        # keep those IDs out of the review queue instead of restarting the loop.
+        runtime.progress.update_classification(
+            candidate_items=set(),
+            rejected_items=set(),
+            uncertain_items={"u1", "u2"},
+        )
+        self.assertNotIn("u1", runtime.progress.uncertain_items)
+        self.assertNotIn("u2", runtime.progress.uncertain_items)
+
+    def test_vlm_semantic_type_is_promoted_by_classifier(self) -> None:
+        classifier = TidyObjectClassifier()
+        classification = classifier.classify(
+            [{"object_id": "u1", "shape": "Unknown", "semantic_type": "Unknown", "vlm_semantic_type": "shoe"}]
+        )
+        self.assertIn("u1", classification.candidate_items)
+        self.assertNotIn("u1", classification.uncertain_items)
+
+
+    def test_non_pickable_tongsim_error_demotes_false_positive(self) -> None:
+        runtime = CompetitionRuntime()
+        runtime.ensure_episode({"task_type": "tidyroom", "subject": "整理房间"})
+        runtime.observe([{"object_id": "u1", "vlm_semantic_type": "shoe"}])
+        runtime.progress.update_classification(
+            candidate_items={"u1"},
+            rejected_items=set(),
+            uncertain_items=set(),
+        )
+        pick = runtime.validate_action(
+            {"action": "move_and_take_object", "parameters": {"object_id": "u1", "which_hand": 0}}
+        )
+        self.assertTrue(pick.valid)
+        runtime.record_action(
+            pick.action,
+            {"result": "failed", "error": "can not take this object for not pickup"},
+            validation=pick,
+        )
+
+        self.assertNotIn("u1", runtime.progress.candidate_items)
+        self.assertNotIn("u1", runtime.progress.failed_objects)
+        self.assertIn("u1", runtime.progress.rejected_items)
+        self.assertEqual(runtime.progress.states["u1"], "REJECTED_NON_PICKABLE")
+
+
 if __name__ == "__main__":
     unittest.main()
