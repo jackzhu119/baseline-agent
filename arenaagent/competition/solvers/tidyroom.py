@@ -151,7 +151,10 @@ class TidyRoomTracker:
         newly_discovered = candidate_items - self.candidate_items - self.completed_objects
         self.candidate_items.update(candidate_items - self.completed_objects)
         self.rejected_items.update(rejected_items)
-        self.uncertain_items.update(uncertain_items)
+        # Uncertainty is view-local: keep only currently unresolved visible objects.
+        # This allows the VLM to review the current camera view without permanently
+        # blocking completion because of stale Unknown objects seen many turns ago.
+        self.uncertain_items = set(uncertain_items)
         self.uncertain_items.difference_update(self.candidate_items | self.rejected_items | self.completed_objects)
         self.target_surfaces.update(target_surfaces or set())
         for object_id in self.candidate_items:
@@ -334,6 +337,8 @@ class TidyRoomTracker:
         unresolved = self.remaining_candidates()
         if unresolved:
             return False, f"high-confidence clutter remains unresolved: {sorted(unresolved)}"
+        if self.uncertain_items:
+            return False, f"current view still contains objects requiring VLM review: {sorted(self.uncertain_items)}"
         if self.failed_objects:
             return False, f"failed clutter remains unresolved: {sorted(self.failed_objects)}"
         if self.coverage_verified:

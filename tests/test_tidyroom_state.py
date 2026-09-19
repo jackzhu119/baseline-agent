@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from arenaagent.competition.runtime import CompetitionRuntime
+from arenaagent.competition.solvers.tidyroom_policy import TidyObjectClassifier
 
 
 class TidyRoomStateTests(unittest.TestCase):
@@ -252,6 +253,93 @@ class TidyRoomStateTests(unittest.TestCase):
 
         self.assertFalse(decision.valid)
         self.assertEqual(decision.failure_class, "PLANNING_ERROR")
+
+
+    def test_unknown_object_is_sent_to_vlm_review_context(self) -> None:
+        classifier = TidyObjectClassifier(max_prompt_objects=18, max_review_objects=10)
+        classification = classifier.classify(
+            [
+                {"object_id": "u1", "shape": "Unknown", "color": "red"},
+                {"object_id": "wall", "name": "wall"},
+            ]
+        )
+
+        relevant = classifier.relevant_objects(classification)
+
+        self.assertIn("u1", classification.uncertain_items)
+        self.assertEqual([item["object_id"] for item in relevant], ["u1"])
+        self.assertEqual(relevant[0]["classification_evidence"], "requires VLM visual review")
+
+    def test_finish_guard_blocks_when_current_view_needs_vlm_review(self) -> None:
+        runtime = CompetitionRuntime()
+        runtime.ensure_episode({"task_type": "tidyroom", "subject": "整理房间"})
+        runtime.progress.update_classification(
+            candidate_items=set(),
+            rejected_items=set(),
+            uncertain_items={"u1"},
+        )
+        runtime.progress.coverage_verified = True
+
+        decision = runtime.validate_action(
+            {"action": "finish_task", "parameters": {}, "output": 0},
+            object_in_hand=False,
+        )
+
+        self.assertFalse(decision.valid)
+        self.assertEqual(decision.failure_class, "PREMATURE_FINISH")
+        self.assertIn("VLM review", decision.error)
+
+    def test_vlm_can_pick_current_uncertain_object(self) -> None:
+        runtime = CompetitionRuntime()
+        runtime.ensure_episode({"task_type": "tidyroom", "subject": "整理房间"})
+        runtime.observe([{"object_id": "u1", "shape": "Unknown", "color": "red"}])
+        runtime.progress.update_classification(
+            candidate_items=set(),
+            rejected_items=set(),
+            uncertain_items={"u1"},
+        )
+
+        decision = runtime.validate_action(
+            {"action": "move_and_take_object", "parameters": {"object_id": "u1", "which_hand": 0}},
+            object_in_hand=False,
+        )
+
+        self.assertTrue(decision.valid)
+
+    def test_vlm_reviewed_object_can_only_be_placed_on_semantic_target_surface(self) -> None:
+        runtime = CompetitionRuntime()
+        runtime.ensure_episode({"task_type": "tidyroom", "subject": "整理房间"})
+        runtime.observe(
+            [
+                {"object_id": "u1", "shape": "Unknown", "color": "red"},
+                {"object_id": "rack", "name": "shoe rack", "place_location": [10, 20, 30]},
+            ]
+        )
+        runtime.progress.update_classification(
+            candidate_items=set(),
+            rejected_items=set(),
+            uncertain_items={"u1"},
+            target_surfaces={"rack"},
+        )
+        pick = runtime.validate_action(
+            {"action": "move_and_take_object", "parameters": {"object_id": "u1", "which_hand": 0}}
+        )
+        self.assertTrue(pick.valid)
+        runtime.record_action(pick.action, {"result": "success"}, validation=pick)
+        runtime.update_hand_state(True)
+
+        safe = runtime.validate_action(
+            {"action": "put_down_sth", "parameters": {"target_location": [10, 20, 30]}},
+            object_in_hand=True,
+        )
+        unsafe = runtime.validate_action(
+            {"action": "put_down_sth", "parameters": {"target_location": [99, 99, 99]}},
+            object_in_hand=True,
+        )
+
+        self.assertTrue(safe.valid)
+        self.assertFalse(unsafe.valid)
+        self.assertEqual(unsafe.failure_class, "PLANNING_ERROR")
 
 
 if __name__ == "__main__":

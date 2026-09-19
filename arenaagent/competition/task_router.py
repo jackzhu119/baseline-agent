@@ -212,6 +212,8 @@ class TaskStrategyRouter:
             return "SELECT_TARGET" if progress.selected_target(progress.current_object) is None else "PUT"
         if progress.remaining_candidates():
             return "SELECT_OBJECT"
+        if progress.uncertain_items:
+            return "VLM_REVIEW"
         if progress.coverage_verified:
             return "MARK_COMPLETED"
         return "DISCOVER"
@@ -249,6 +251,11 @@ class TaskStrategyRouter:
             }
 
         if progress.remaining_candidates() or progress.failed_objects:
+            return None
+        # Current-view Unknown/unclassified objects must be reviewed by the VLM
+        # before deterministic final scanning or finish is allowed. Returning
+        # None here intentionally falls through to the normal VLM path.
+        if progress.uncertain_items:
             return None
         if progress.initial_expected_objects and progress.initial_expected_objects <= progress.completed_objects:
             return {
