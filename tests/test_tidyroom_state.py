@@ -387,7 +387,7 @@ class TidyRoomStateTests(unittest.TestCase):
     def test_vlm_semantic_type_is_promoted_by_classifier(self) -> None:
         classifier = TidyObjectClassifier()
         classification = classifier.classify(
-            [{"object_id": "u1", "shape": "Unknown", "vlm_semantic_type": "shoe"}]
+            [{"object_id": "u1", "shape": "Unknown", "semantic_type": "Unknown", "vlm_semantic_type": "shoe"}]
         )
         self.assertIn("u1", classification.candidate_items)
         self.assertNotIn("u1", classification.uncertain_items)
