@@ -342,5 +342,56 @@ class TidyRoomStateTests(unittest.TestCase):
         self.assertEqual(unsafe.failure_class, "PLANNING_ERROR")
 
 
+    def test_batch_vlm_review_promotes_and_rejects_without_repeating(self) -> None:
+        runtime = CompetitionRuntime()
+        runtime.ensure_episode({"task_type": "tidyroom", "subject": "整理房间"})
+        runtime.progress.update_classification(
+            candidate_items=set(),
+            rejected_items=set(),
+            uncertain_items={"u1", "u2"},
+        )
+        runtime.progress.apply_vlm_reviews(
+            [
+                {
+                    "object_id": "u1",
+                    "is_clutter": True,
+                    "category": "shoe",
+                    "confidence": 0.95,
+                    "target_id": "rack",
+                },
+                {
+                    "object_id": "u2",
+                    "is_clutter": False,
+                    "category": "other",
+                    "confidence": 0.98,
+                    "target_id": None,
+                },
+            ]
+        )
+
+        self.assertIn("u1", runtime.progress.candidate_items)
+        self.assertIn("u2", runtime.progress.rejected_items)
+        self.assertNotIn("u1", runtime.progress.uncertain_items)
+        self.assertNotIn("u2", runtime.progress.uncertain_items)
+
+        # A later raw frame may still say Unknown. Persisted VLM verdicts must
+        # keep those IDs out of the review queue instead of restarting the loop.
+        runtime.progress.update_classification(
+            candidate_items=set(),
+            rejected_items=set(),
+            uncertain_items={"u1", "u2"},
+        )
+        self.assertNotIn("u1", runtime.progress.uncertain_items)
+        self.assertNotIn("u2", runtime.progress.uncertain_items)
+
+    def test_vlm_semantic_type_is_promoted_by_classifier(self) -> None:
+        classifier = TidyObjectClassifier()
+        classification = classifier.classify(
+            [{"object_id": "u1", "shape": "Unknown", "vlm_semantic_type": "shoe"}]
+        )
+        self.assertIn("u1", classification.candidate_items)
+        self.assertNotIn("u1", classification.uncertain_items)
+
+
 if __name__ == "__main__":
     unittest.main()
