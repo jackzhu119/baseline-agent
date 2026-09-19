@@ -763,6 +763,44 @@ class CompetitionRuntime:
             and not object_in_hand
         ):
             return self._invalid(normalized, "cannot place an object while both hands are empty", "ACTION_ERROR")
+        if self.task_type == "tidyroom" and self.progress.current_object:
+            current_id = self.progress.current_object
+            selected_target = self.progress.selected_target(current_id)
+            official_object = current_id in self.progress.initial_expected_objects
+            if name in {"put_down_sth", "move_and_put_down", "move_and_put_down_object_in_container"}:
+                if selected_target is None and not official_object:
+                    return self._invalid(
+                        normalized,
+                        f"held object {current_id!r} has no high-confidence semantic placement target",
+                        "PLANNING_ERROR",
+                    )
+                if selected_target is not None and name != "move_and_put_down_object_in_container":
+                    requested = next(
+                        (
+                            params.get(key)
+                            for key in ("put_target_location", "put_location", "target_location")
+                            if params.get(key) is not None
+                        ),
+                        None,
+                    )
+                    requested_position = _object_position({"position": requested}) if _is_location(requested) else None
+                    selected_position = _object_position({"position": selected_target.get("location")})
+                    if (
+                        requested_position is None
+                        or selected_position is None
+                        or math.dist(requested_position, selected_position) > 5.0
+                    ):
+                        return self._invalid(
+                            normalized,
+                            "placement does not match the current object's selected semantic target",
+                            "PLANNING_ERROR",
+                        )
+            if name in {"move_to_location", "move_to_object"} and selected_target is None and not official_object:
+                return self._invalid(
+                    normalized,
+                    "holding state permits only target-directed movement or observation recovery",
+                    "PLANNING_ERROR",
+                )
         if name in {"submit_answer", "submit_puzzle_answer"} and normalized.get("output") in (None, ""):
             return self._invalid(normalized, "submit_answer requires a non-empty output", "TERMINATION_ERROR")
         if name == "finish_task" and self.task_type in {"counting", "npc", "raven"}:

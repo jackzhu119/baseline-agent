@@ -232,6 +232,27 @@ class TidyRoomStateTests(unittest.TestCase):
         self.assertFalse(decision.valid)
         self.assertEqual(decision.failure_class, "LOOP_ERROR")
 
+    def test_nonofficial_clutter_cannot_be_put_at_arbitrary_location(self) -> None:
+        runtime = CompetitionRuntime()
+        runtime.ensure_episode({"task_type": "tidyroom", "subject": "整理房间"})
+        runtime.observe([{"object_id": "shoe-1", "name": "shoe", "position": [1, 2, 3]}])
+        runtime.progress.update_classification(
+            candidate_items={"shoe-1"}, rejected_items=set(), uncertain_items=set()
+        )
+        runtime.record_action(
+            {"action": "move_and_take_object", "parameters": {"object_id": "shoe-1"}},
+            {"result": "success"},
+        )
+        runtime.update_hand_state(True)
+
+        decision = runtime.validate_action(
+            {"action": "put_down_sth", "parameters": {"target_location": [99, 99, 99]}},
+            object_in_hand=True,
+        )
+
+        self.assertFalse(decision.valid)
+        self.assertEqual(decision.failure_class, "PLANNING_ERROR")
+
 
 if __name__ == "__main__":
     unittest.main()
