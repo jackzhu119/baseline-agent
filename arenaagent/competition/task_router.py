@@ -186,6 +186,10 @@ class TaskStrategyRouter:
             if target_id in runtime.objects
         }
         for candidate_id in sorted(runtime.progress.remaining_candidates()):
+            # Preserve an explicit VLM batch-review target when one was grounded
+            # to a currently visible official placement candidate.
+            if runtime.progress.selected_target(candidate_id) is not None:
+                continue
             item = runtime.objects.get(candidate_id)
             if item is None:
                 continue
@@ -198,6 +202,7 @@ class TaskStrategyRouter:
                 "candidate_count": len(runtime.progress.remaining_candidates()),
                 "target_assignment_count": len(runtime.progress.target_assignments),
                 "final_scan_count": runtime.progress.final_scan_count,
+                "vlm_review_count": len(runtime.progress.vlm_reviews),
             }
         )
 
