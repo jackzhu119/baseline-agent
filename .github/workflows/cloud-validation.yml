@@ -48,6 +48,9 @@ jobs:
           "torchvision==0.25.0"
           --torch-backend cpu
 
+      - name: Generate protobuf bindings
+        run: uv run --no-sync python scripts/generate_pb2.py
+
       - name: Run complete regression suite
         run: uv run --no-sync pytest -q
 
@@ -122,5 +125,7 @@ jobs:
       - name: Run official release preflight
         if: env.TONGSIM_LINUX_URL != ''
         run: |
-          uv sync --extra dev --locked
-          uv run python scripts/preflight.py --release-dir "$RUNNER_TEMP/tongsim-release"
+          uv sync --extra dev --locked --no-install-package torch --no-install-package torchvision
+          uv pip install "torch==2.10.0" "torchvision==0.25.0" --torch-backend cpu
+          uv run --no-sync python scripts/generate_pb2.py
+          uv run --no-sync python scripts/preflight.py --release-dir "$RUNNER_TEMP/tongsim-release"
