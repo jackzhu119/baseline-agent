@@ -35,18 +35,28 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           echo "Agent build revision: ${AGENT_BUILD_SHA:0:12}"
 
-      - name: Install project dependencies
-        run: uv sync --extra dev --locked
+      - name: Install locked dependencies without CUDA payloads
+        run: >-
+          uv sync --extra dev --locked
+          --no-install-package torch
+          --no-install-package torchvision
+
+      - name: Install CPU-only PyTorch runtime
+        run: >-
+          uv pip install
+          "torch==2.10.0"
+          "torchvision==0.25.0"
+          --torch-backend cpu
 
       - name: Run complete regression suite
-        run: uv run pytest -q
+        run: uv run --no-sync pytest -q
 
       - name: Compile Python sources
-        run: uv run python -m compileall -q arenaagent tests scripts
+        run: uv run --no-sync python -m compileall -q arenaagent tests scripts
 
       - name: Check critical files with Ruff
         run: >-
-          uv run ruff check
+          uv run --no-sync ruff check
           arenaagent/build_info.py
           arenaagent/competition/runtime.py
           arenaagent/competition/solvers/tidyroom.py
