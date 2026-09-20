@@ -1,0 +1,116 @@
+name: TongSIM Cloud Validation
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tongsim-cloud-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-regression:
+    name: Repository regression (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AGENT_BUILD_SHA: ${{ github.sha }}
+    steps:
+      - name: Check out exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.14"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Verify revision
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          echo "Agent build revision: ${AGENT_BUILD_SHA:0:12}"
+
+      - name: Install project dependencies
+        run: uv sync --extra dev --locked
+
+      - name: Run complete regression suite
+        run: uv run pytest -q
+
+      - name: Compile Python sources
+        run: uv run python -m compileall -q arenaagent tests scripts
+
+      - name: Check critical files with Ruff
+        run: >-
+          uv run ruff check
+          arenaagent/build_info.py
+          arenaagent/competition/runtime.py
+          arenaagent/competition/solvers/tidyroom.py
+          arenaagent/competition/solvers/tidyroom_policy.py
+          arenaagent/competition/task_router.py
+          arenaagent/vlm_agent/vlm_agent.py
+          scripts/__init__.py
+          tests/test_agent_integration.py
+          tests/test_build_info.py
+          tests/test_task_router.py
+          tests/test_tidyroom_prompt_budget.py
+          tests/test_tidyroom_state.py
+          --select E,F --output-format concise
+
+  official-platform-preflight:
+    name: Optional official Linux platform preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TONGSIM_LINUX_URL: ${{ secrets.TONGSIM_LINUX_URL }}
+      TONGSIM_LINUX_SHA256: ${{ secrets.TONGSIM_LINUX_SHA256 }}
+    steps:
+      - name: Check out exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        if: env.TONGSIM_LINUX_URL != ''
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.12.14"
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Explain missing official package URL
+        if: env.TONGSIM_LINUX_URL == ''
+        run: |
+          echo "Official platform preflight was not run."
+          echo "Add a repository secret named TONGSIM_LINUX_URL containing a legal direct Linux-package URL."
+          echo "Optionally add TONGSIM_LINUX_SHA256 for integrity verification, then run this workflow again."
+
+      - name: Download and inspect official package
+        if: env.TONGSIM_LINUX_URL != ''
+        run: |
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/tongsim-package" "$TONGSIM_LINUX_URL"
+          test "$(stat --format=%s "$RUNNER_TEMP/tongsim-package")" -gt 1048576
+          file "$RUNNER_TEMP/tongsim-package"
+          sha256sum "$RUNNER_TEMP/tongsim-package"
+          if [ -n "$TONGSIM_LINUX_SHA256" ]; then
+            echo "$TONGSIM_LINUX_SHA256  $RUNNER_TEMP/tongsim-package" | sha256sum --check --strict
+          fi
+
+      - name: Extract package
+        if: env.TONGSIM_LINUX_URL != ''
+        run: |
+          mkdir -p "$RUNNER_TEMP/tongsim-release"
+          if file "$RUNNER_TEMP/tongsim-package" | grep -qi 'zip archive'; then
+            python -m zipfile -e "$RUNNER_TEMP/tongsim-package" "$RUNNER_TEMP/tongsim-release"
+          else
+            tar -xf "$RUNNER_TEMP/tongsim-package" -C "$RUNNER_TEMP/tongsim-release"
+          fi
+          find "$RUNNER_TEMP/tongsim-release" -maxdepth 3 -type f -printf '%P\n' | sort | head -200
+
+      - name: Run official release preflight
+        if: env.TONGSIM_LINUX_URL != ''
+        run: |
+          uv sync --extra dev --locked
+          uv run python scripts/preflight.py --release-dir "$RUNNER_TEMP/tongsim-release"
