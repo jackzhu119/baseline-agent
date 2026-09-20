@@ -88,6 +88,9 @@ _TARGET_TERMS = {
     "bed",
     "fridge",
     "refrigerator",
+    "soft",
+    "surface",
+    "drinkware",
     "桌",
     "沙发",
     "柜",
@@ -97,8 +100,28 @@ _TARGET_TERMS = {
     "收纳",
     "区域",
 }
-_SEMANTIC_FIELDS = ("name", "semantic_type", "vlm_semantic_type", "category", "type", "class", "label", "description")
-_COMPACT_FIELDS = ("name", "semantic_type", "vlm_semantic_type", "category", "type", "color", "shape", "position")
+_SEMANTIC_FIELDS = (
+    "name",
+    "semantic_type",
+    "vlm_semantic_type",
+    "vlm_target_type",
+    "category",
+    "type",
+    "class",
+    "label",
+    "description",
+)
+_COMPACT_FIELDS = (
+    "name",
+    "semantic_type",
+    "vlm_semantic_type",
+    "vlm_target_type",
+    "category",
+    "type",
+    "color",
+    "shape",
+    "position",
+)
 
 
 def object_id(item: Any) -> str:
@@ -250,7 +273,10 @@ class TidyTargetPlanner:
         best = ranked[0]
         runner_up = float(ranked[1]["confidence"]) if len(ranked) > 1 else 0.0
         assignment.confidence = float(best["confidence"])
-        if assignment.confidence >= self.AUTO_SELECT_CONFIDENCE and assignment.confidence - runner_up >= self.UNIQUE_MARGIN:
+        if (
+            assignment.confidence >= self.AUTO_SELECT_CONFIDENCE
+            and assignment.confidence - runner_up >= self.UNIQUE_MARGIN
+        ):
             assignment.selected_target = best
             assignment.reason = str(best["reason"])
         else:
@@ -260,16 +286,36 @@ class TidyTargetPlanner:
     @staticmethod
     def _semantic_compatibility(object_text: str, target_text: str) -> tuple[float, str]:
         mappings = (
-            ({"shoe", "shoes", "sneaker", "boot", "boots", "slipper", "鞋", "靴", "拖鞋"},
-             {"shoe", "rack", "shelf", "area", "zone", "鞋", "架", "区域"}, 0.98, "shoe storage"),
-            ({"trash", "garbage", "rubbish", "litter", "垃圾"},
-             {"trash", "garbage", "bin", "垃圾桶", "垃圾"}, 1.0, "trash receptacle"),
-            ({"pillow", "cushion", "枕头", "抱枕"},
-             {"sofa", "bed", "pillow", "cushion", "沙发", "床", "枕头", "抱枕"}, 0.96, "soft-furnishing area"),
-            ({"cup", "mug", "bottle", "杯", "瓶"},
-             {"cup", "mug", "bottle", "table", "shelf", "area", "杯", "瓶", "桌", "架", "区域"}, 0.91, "drinkware area"),
-            ({"food", "apple", "banana", "bread", "食物", "食品"},
-             {"food", "storage", "cabinet", "fridge", "refrigerator", "食品", "食物", "收纳", "柜"}, 0.95, "food storage"),
+            (
+                {"shoe", "shoes", "sneaker", "boot", "boots", "slipper", "鞋", "靴", "拖鞋"},
+                {"shoe", "rack", "shelf", "area", "zone", "鞋", "架", "区域"},
+                0.98,
+                "shoe storage",
+            ),
+            (
+                {"trash", "garbage", "rubbish", "litter", "垃圾"},
+                {"trash", "garbage", "bin", "垃圾桶", "垃圾"},
+                1.0,
+                "trash receptacle",
+            ),
+            (
+                {"pillow", "cushion", "枕头", "抱枕"},
+                {"sofa", "bed", "pillow", "cushion", "soft", "surface", "沙发", "床", "枕头", "抱枕"},
+                0.96,
+                "soft-furnishing area",
+            ),
+            (
+                {"cup", "mug", "bottle", "杯", "瓶"},
+                {"cup", "mug", "bottle", "drinkware", "table", "shelf", "area", "杯", "瓶", "桌", "架", "区域"},
+                0.91,
+                "drinkware area",
+            ),
+            (
+                {"food", "apple", "banana", "bread", "食物", "食品"},
+                {"food", "storage", "cabinet", "fridge", "refrigerator", "食品", "食物", "收纳", "柜"},
+                0.95,
+                "food storage",
+            ),
         )
         for object_terms, target_terms, score, reason in mappings:
             if _contains_term(object_text, object_terms) and _contains_term(target_text, target_terms):
@@ -314,6 +360,11 @@ class TidyObjectClassifier:
             if current_id in required:
                 result.candidate_items[current_id] = self._compact(item, "official task object")
                 continue
+            vlm_target = str(item.get("vlm_target_type") or "").strip().lower()
+            if vlm_target and _contains_term(vlm_target, _TARGET_TERMS):
+                result.target_surfaces[current_id] = self._compact(item, "VLM-reviewed target surface")
+                result.rejected_items[current_id] = "VLM-reviewed target surface"
+                continue
             if _contains_term(semantic_text, _TARGET_TERMS):
                 result.target_surfaces[current_id] = self._compact(item, "semantic target surface")
             if _contains_term(semantic_text, _STATIC_TERMS):
@@ -352,8 +403,7 @@ class TidyObjectClassifier:
         review_budget = min(self.max_review_objects, max(self.max_prompt_objects - len(ordered), 0))
         if review_budget:
             ordered.extend(
-                classification.review_items[key]
-                for key in sorted(classification.review_items)[:review_budget]
+                classification.review_items[key] for key in sorted(classification.review_items)[:review_budget]
             )
         return ordered[: self.max_prompt_objects]
 

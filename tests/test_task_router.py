@@ -153,6 +153,60 @@ class TaskStrategyRouterTests(unittest.TestCase):
         self.assertFalse(finish.valid)
         self.assertIn("unresolved", finish.error)
 
+    def test_tidyroom_actively_reinspects_pending_placement_target(self) -> None:
+        runtime = CompetitionRuntime()
+        subject = {"task_type": "tidyroom", "subject": "整理房间", "movable_object_id": ["cup"]}
+        runtime.ensure_episode(subject)
+        runtime.observe([{"object_id": "cup", "name": "cup"}])
+        runtime.record_action(
+            {"action": "move_and_take_object", "parameters": {"object_id": "cup"}},
+            {"result": "success"},
+        )
+        runtime.update_hand_state(True)
+        runtime.record_action(
+            {"action": "put_down_sth", "parameters": {"target_location": [4, 5, 6]}},
+            {"result": "success"},
+        )
+        runtime.update_hand_state(False)
+        router = TaskStrategyRouter()
+
+        action = router.propose_action(subject, runtime)
+
+        self.assertEqual(action["action"], "look_at_location")
+        self.assertEqual(action["parameters"]["target_location"], [4.0, 5.0, 6.0])
+
+    def test_vlm_discovered_unknown_target_can_drive_semantic_pick_plan(self) -> None:
+        runtime = CompetitionRuntime()
+        subject = {"task_type": "tidyroom", "subject": "整理房间"}
+        runtime.ensure_episode(subject)
+        runtime.observe(
+            [
+                {"object_id": "shoe", "name": "shoe", "position": [1, 2, 3]},
+                {"object_id": "unknown-rack", "name": "Unknown", "place_location": [10, 20, 3]},
+            ]
+        )
+        runtime.progress.update_classification(
+            candidate_items={"shoe"}, rejected_items=set(), uncertain_items={"unknown-rack"}
+        )
+        runtime.progress.apply_vlm_reviews(
+            [
+                {
+                    "object_id": "unknown-rack",
+                    "role": "target_surface",
+                    "category": "shoe_storage",
+                    "confidence": 0.95,
+                }
+            ]
+        )
+        runtime.objects["unknown-rack"]["vlm_target_type"] = "shoe_storage"
+        router = TaskStrategyRouter()
+
+        router.observe(runtime, subject)
+        action = router.propose_action(subject, runtime)
+
+        self.assertEqual(action["action"], "move_and_take_object")
+        self.assertEqual(action["parameters"]["object_id"], "shoe")
+
 
 if __name__ == "__main__":
     unittest.main()

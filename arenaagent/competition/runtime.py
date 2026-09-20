@@ -869,7 +869,14 @@ class CompetitionRuntime:
                 "finish_task",
             }
             final_scan_allowed = name == "turn_in_degree" and self.progress.final_scan_count <= 2
-            if name not in critical_allowed and not final_scan_allowed:
+            verification_allowed = name == "look_at_location" and self.progress.pending_place is not None
+            focused_review_allowed = name == "look_at_object" and bool(self.progress.uncertain_items)
+            if (
+                name not in critical_allowed
+                and not final_scan_allowed
+                and not verification_allowed
+                and not focused_review_allowed
+            ):
                 return self._invalid(
                     normalized,
                     "critical time phase blocks low-value exploration",
@@ -878,7 +885,10 @@ class CompetitionRuntime:
 
         if name == "move_and_take_object":
             if self.task_type == "tidyroom" and (
-                object_in_hand or self.progress.current_object or self.progress.pending_pick or self.progress.pending_place
+                object_in_hand
+                or self.progress.current_object
+                or self.progress.pending_pick
+                or self.progress.pending_place
             ):
                 return self._invalid(
                     normalized,
@@ -896,15 +906,11 @@ class CompetitionRuntime:
                     "PLANNING_ERROR",
                 )
             if self.task_type == "tidyroom":
-                allowed_ids = (
-                    self.progress.candidate_items
-                    | self.progress.initial_expected_objects
-                    | self.progress.uncertain_items
-                )
+                allowed_ids = self.progress.candidate_items | self.progress.initial_expected_objects
                 if canonical_id not in allowed_ids:
                     return self._invalid(
                         normalized,
-                        f"object {object_id!r} is neither approved clutter nor a current VLM-review candidate",
+                        f"object {object_id!r} is not approved clutter; focused visual review must resolve it first",
                         "PLANNING_ERROR",
                     )
                 can_attempt, reason = self.progress.can_attempt_pick(canonical_id, self.metrics.steps)

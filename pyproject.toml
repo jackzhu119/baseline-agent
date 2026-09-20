@@ -125,3 +125,6 @@ per-file-ignores = [
   "arena/tasks/cognition/utils/*.py:N802,E722",
 ]
 exclude = ["build", "*_pb2.py", "*_grpc.py"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

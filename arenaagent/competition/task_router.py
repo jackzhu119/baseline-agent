@@ -5,7 +5,7 @@ from typing import Any
 from arenaagent.competition.runtime import CompetitionRuntime
 from arenaagent.competition.solvers.counting import CountingSolver
 from arenaagent.competition.solvers.jigsaw import JigsawSpatialSolver
-from arenaagent.competition.solvers.tidyroom import MAX_FINAL_SCANS
+from arenaagent.competition.solvers.tidyroom import MAX_FINAL_SCANS, MAX_PLACEMENT_VERIFICATION_VIEWS
 from arenaagent.competition.solvers.tidyroom_policy import TidyObjectClassifier, TidyTargetPlanner
 
 JIGSAW_AUTO_PLACEMENT_CONFIDENCE = 0.8
@@ -182,8 +182,8 @@ class TaskStrategyRouter:
         placements = runtime.placement_candidates()
         target_items = {
             target_id: runtime.objects[target_id]
-            for target_id in classification.target_surfaces
-            if target_id in runtime.objects
+            for target_id in runtime.progress.target_surfaces
+            if target_id in runtime.objects and target_id in runtime.visible_canonical_ids
         }
         for candidate_id in sorted(runtime.progress.remaining_candidates()):
             # Preserve an explicit VLM batch-review target when one was grounded
@@ -226,7 +226,19 @@ class TaskStrategyRouter:
     @staticmethod
     def _propose_tidyroom_action(runtime: CompetitionRuntime) -> dict[str, Any] | None:
         progress = runtime.progress
-        if progress.pending_pick or progress.pending_place:
+        if progress.pending_pick:
+            return None
+        if progress.pending_place:
+            target = progress.pending_place_target
+            attempts = progress.placement_verification_attempts[progress.pending_place]
+            if isinstance(target, list) and attempts < MAX_PLACEMENT_VERIFICATION_VIEWS:
+                return {
+                    "think": "actively re-inspect the intended target to verify the completed placement",
+                    "action": "look_at_location",
+                    "parameters": {"target_location": target},
+                    "output": 0,
+                    "expected_change": "fresh perception verifies the placed object at the intended target",
+                }
             return None
         if progress.current_object:
             selected = progress.selected_target(progress.current_object)

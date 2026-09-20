@@ -185,9 +185,7 @@ class TidyRoomStateTests(unittest.TestCase):
 
     def test_holding_object_blocks_pick_of_new_object(self) -> None:
         runtime = CompetitionRuntime(repeated_action_limit=2)
-        runtime.ensure_episode(
-            {"task_type": "tidyroom", "subject": "整理房间", "movable_object_id": ["7", "8"]}
-        )
+        runtime.ensure_episode({"task_type": "tidyroom", "subject": "整理房间", "movable_object_id": ["7", "8"]})
         runtime.observe([{"object_id": "7", "name": "cup"}, {"object_id": "8", "name": "shoe"}])
         runtime.record_action(
             {"action": "move_and_take_object", "parameters": {"object_id": "7"}},
@@ -237,9 +235,7 @@ class TidyRoomStateTests(unittest.TestCase):
         runtime = CompetitionRuntime()
         runtime.ensure_episode({"task_type": "tidyroom", "subject": "整理房间"})
         runtime.observe([{"object_id": "shoe-1", "name": "shoe", "position": [1, 2, 3]}])
-        runtime.progress.update_classification(
-            candidate_items={"shoe-1"}, rejected_items=set(), uncertain_items=set()
-        )
+        runtime.progress.update_classification(candidate_items={"shoe-1"}, rejected_items=set(), uncertain_items=set())
         runtime.record_action(
             {"action": "move_and_take_object", "parameters": {"object_id": "shoe-1"}},
             {"result": "success"},
@@ -253,7 +249,6 @@ class TidyRoomStateTests(unittest.TestCase):
 
         self.assertFalse(decision.valid)
         self.assertEqual(decision.failure_class, "PLANNING_ERROR")
-
 
     def test_unknown_object_is_sent_to_vlm_review_context(self) -> None:
         classifier = TidyObjectClassifier(max_prompt_objects=18, max_review_objects=10)
@@ -289,7 +284,7 @@ class TidyRoomStateTests(unittest.TestCase):
         self.assertEqual(decision.failure_class, "PREMATURE_FINISH")
         self.assertIn("VLM review", decision.error)
 
-    def test_vlm_can_pick_current_uncertain_object(self) -> None:
+    def test_unreviewed_uncertain_object_cannot_be_picked(self) -> None:
         runtime = CompetitionRuntime()
         runtime.ensure_episode({"task_type": "tidyroom", "subject": "整理房间"})
         runtime.observe([{"object_id": "u1", "shape": "Unknown", "color": "red"}])
@@ -304,7 +299,8 @@ class TidyRoomStateTests(unittest.TestCase):
             object_in_hand=False,
         )
 
-        self.assertTrue(decision.valid)
+        self.assertFalse(decision.valid)
+        self.assertIn("focused visual review", decision.error)
 
     def test_vlm_reviewed_object_can_only_be_placed_on_semantic_target_surface(self) -> None:
         runtime = CompetitionRuntime()
@@ -320,6 +316,9 @@ class TidyRoomStateTests(unittest.TestCase):
             rejected_items=set(),
             uncertain_items={"u1"},
             target_surfaces={"rack"},
+        )
+        runtime.progress.apply_vlm_reviews(
+            [{"object_id": "u1", "role": "clutter", "category": "shoe", "confidence": 0.95}]
         )
         pick = runtime.validate_action(
             {"action": "move_and_take_object", "parameters": {"object_id": "u1", "which_hand": 0}}
@@ -340,7 +339,6 @@ class TidyRoomStateTests(unittest.TestCase):
         self.assertTrue(safe.valid)
         self.assertFalse(unsafe.valid)
         self.assertEqual(unsafe.failure_class, "PLANNING_ERROR")
-
 
     def test_batch_vlm_review_promotes_and_rejects_without_repeating(self) -> None:
         runtime = CompetitionRuntime()
@@ -392,7 +390,6 @@ class TidyRoomStateTests(unittest.TestCase):
         self.assertIn("u1", classification.candidate_items)
         self.assertNotIn("u1", classification.uncertain_items)
 
-
     def test_non_pickable_tongsim_error_demotes_false_positive(self) -> None:
         runtime = CompetitionRuntime()
         runtime.ensure_episode({"task_type": "tidyroom", "subject": "整理房间"})
@@ -416,6 +413,83 @@ class TidyRoomStateTests(unittest.TestCase):
         self.assertNotIn("u1", runtime.progress.failed_objects)
         self.assertIn("u1", runtime.progress.rejected_items)
         self.assertEqual(runtime.progress.states["u1"], "REJECTED_NON_PICKABLE")
+        runtime.progress.update_classification(candidate_items={"u1"}, rejected_items=set(), uncertain_items=set())
+        self.assertNotIn("u1", runtime.progress.candidate_items)
+
+    def test_vlm_target_surface_review_is_persisted(self) -> None:
+        classifier = TidyObjectClassifier()
+        runtime = CompetitionRuntime()
+        runtime.ensure_episode({"task_type": "tidyroom", "subject": "整理房间"})
+        runtime.observe([{"object_id": "u-target", "place_location": [4, 5, 6]}])
+        runtime.progress.update_classification(
+            candidate_items=set(), rejected_items=set(), uncertain_items={"u-target"}
+        )
+        runtime.progress.apply_vlm_reviews(
+            [
+                {
+                    "object_id": "u-target",
+                    "role": "target_surface",
+                    "category": "shoe_storage",
+                    "confidence": 0.94,
+                }
+            ]
+        )
+        runtime.objects["u-target"]["vlm_target_type"] = "shoe_storage"
+
+        classification = classifier.classify([runtime.objects["u-target"]])
+
+        self.assertIn("u-target", runtime.progress.target_surfaces)
+        self.assertIn("u-target", classification.target_surfaces)
+        self.assertNotIn("u-target", classification.uncertain_items)
+
+    def test_two_ambiguous_focused_reviews_are_bounded_and_deferred(self) -> None:
+        runtime = CompetitionRuntime()
+        runtime.ensure_episode({"task_type": "tidyroom", "subject": "整理房间"})
+        runtime.progress.update_classification(candidate_items=set(), rejected_items=set(), uncertain_items={"u1"})
+        ambiguous = [{"object_id": "u1", "role": "clutter", "category": "other", "confidence": 0.9}]
+
+        runtime.progress.apply_vlm_reviews(ambiguous)
+        self.assertIn("u1", runtime.progress.uncertain_items)
+        runtime.progress.apply_vlm_reviews(ambiguous)
+
+        self.assertNotIn("u1", runtime.progress.uncertain_items)
+        self.assertIn("u1", runtime.progress.deferred_items)
+        self.assertEqual(runtime.progress.review_attempts["u1"], 2)
+
+    def test_successful_put_is_verified_after_two_target_reinspections(self) -> None:
+        runtime = self.make_runtime()
+        runtime.record_action(
+            {"action": "move_and_take_object", "parameters": {"object_id": "7"}},
+            {"result": "success"},
+        )
+        runtime.update_hand_state(True)
+        runtime.record_action(
+            {"action": "put_down_sth", "parameters": {"target_location": [1, 2, 3]}},
+            {"result": "success"},
+        )
+        runtime.update_hand_state(False)
+        for _ in range(2):
+            runtime.record_action(
+                {"action": "look_at_location", "parameters": {"target_location": [1, 2, 3]}},
+                {"result": "success"},
+            )
+            runtime.observe([])
+            runtime.update_hand_state(False)
+
+        self.assertIn("7", runtime.progress.completed_objects)
+        self.assertIn("two target reinspections", runtime.progress.placement_evidence["7"])
+
+    def test_non_pickable_error_supports_structured_and_chinese_variants(self) -> None:
+        for result in (
+            {"result": "failed", "error_code": "OBJECT_NOT_PICKABLE"},
+            {"result": "failed", "message": "该物体不可拾取"},
+        ):
+            runtime = CompetitionRuntime()
+            runtime.ensure_episode({"task_type": "tidyroom", "subject": "整理房间"})
+            runtime.observe([{"object_id": "u1", "vlm_semantic_type": "shoe"}])
+            runtime.progress.update_classification(candidate_items={"u1"}, rejected_items=set(), uncertain_items=set())
+            runtime.record_action({"action": "move_and_take_object", "parameters": {"object_id": "u1"}}, result)
+            self.assertEqual(runtime.progress.states["u1"], "REJECTED_NON_PICKABLE")
 
 
 if __name__ == "__main__":

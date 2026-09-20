@@ -31,6 +31,10 @@ class FakeTongSim:
         self.calls.append(("turn_in_degree", degree))
         return {"result": "success"}
 
+    def look_at_object(self, character_id, object_id, is_cancel=False):
+        self.calls.append(("look_at_object", object_id))
+        return {"result": "success"}
+
 
 class FakeClient:
     def __init__(self, text: str) -> None:
@@ -138,7 +142,7 @@ class AgentIntegrationTests(unittest.TestCase):
         agent, tongsim, client = self.make_agent(
             '[{"think":"guess","action":"move_and_take_object","parameters":{"object_id":"999"},"output":0}]'
         )
-        result = agent.run_step({"task_type": "tidyroom", "subject": "整理房间"}, {})
+        result = agent.run_step({"task_type": "unknown", "subject": "测试动作校验"}, {})
         self.assertEqual(client.calls, 2)
         self.assertEqual(tongsim.calls, [("turn_in_degree", 45.0)])
         self.assertEqual(result["result"], "success")
@@ -204,7 +208,7 @@ class AgentIntegrationTests(unittest.TestCase):
         agent, tongsim, _ = self.make_agent(
             '[{"think":"visible","action":"move_and_take_object","parameters":{"object_id":"1"},"output":0}]'
         )
-        result = agent.run_step({"task_type": "tidyroom", "subject": "整理房间"}, {})
+        result = agent.run_step({"task_type": "unknown", "subject": "测试可见物体动作"}, {})
         self.assertEqual(result["result"], "success")
         self.assertEqual(tongsim.calls, [("move_and_take_object", "1")])
 
@@ -232,7 +236,7 @@ class AgentIntegrationTests(unittest.TestCase):
         agent, tongsim, _ = self.make_agent("not used")
         client = RaisingClient()
         agent.vlm_client = client
-        result = agent.run_step({"task_id": "timeout-1", "task_type": "tidyroom", "subject": "整理房间"}, {})
+        result = agent.run_step({"task_id": "timeout-1", "task_type": "unknown", "subject": "测试恢复"}, {})
         self.assertEqual(client.calls, 2)
         self.assertEqual(tongsim.calls, [("turn_in_degree", 45.0)])
         self.assertEqual(result["result"], "success")
@@ -255,7 +259,7 @@ class AgentIntegrationTests(unittest.TestCase):
         agent, tongsim, _ = self.make_agent("not used")
         client = ErrorResponseClient("rate limit")
         agent.vlm_client = client
-        result = agent.run_step({"task_id": "rate-1", "task_type": "tidyroom", "subject": "整理房间"}, {})
+        result = agent.run_step({"task_id": "rate-1", "task_type": "unknown", "subject": "测试恢复"}, {})
         self.assertEqual(client.calls, 2)
         self.assertEqual(result["result"], "success")
         self.assertEqual(tongsim.calls, [("turn_in_degree", 45.0)])
@@ -264,9 +268,7 @@ class AgentIntegrationTests(unittest.TestCase):
     def test_safe_fallback_does_not_place_on_low_confidence_surface(self) -> None:
         agent, _, _ = self.make_agent("not used")
         runtime = agent._competition
-        runtime.ensure_episode(
-            {"task_id": "placement-confidence", "task_type": "tidyroom", "movable_object_id": ["1"]}
-        )
+        runtime.ensure_episode({"task_id": "placement-confidence", "task_type": "tidyroom", "movable_object_id": ["1"]})
         runtime.observe(
             [
                 {"object_id": "1", "world_aabb": {"min": {"X": 0, "Y": 0, "Z": 0}, "max": {"X": 2, "Y": 2, "Z": 2}}},
@@ -366,7 +368,7 @@ class AgentIntegrationTests(unittest.TestCase):
                 '[{"action":"move_and_take_object","params":{"object_id":"1"},"output":0}]',
             ]
         )
-        result = agent.run_step({"task_id": "repair-1", "task_type": "tidyroom", "subject": "整理房间"}, {})
+        result = agent.run_step({"task_id": "repair-1", "task_type": "unknown", "subject": "测试修复"}, {})
         self.assertEqual(result["result"], "success")
         self.assertEqual(agent.vlm_client.calls, 2)
         self.assertEqual(tongsim.calls, [("move_and_take_object", "1")])
@@ -385,12 +387,30 @@ class AgentIntegrationTests(unittest.TestCase):
         self.assertNotIn("slice_food", api_info)
 
     def test_prompt_context_size_is_recorded_without_image_payload(self) -> None:
-        agent, _, _ = self.make_agent(
-            '[{"action":"move_and_take_object","parameters":{"object_id":"1"},"output":0}]'
-        )
-        agent.run_step({"task_id": "prompt-size", "task_type": "tidyroom", "subject": "整理房间"}, {})
+        agent, _, _ = self.make_agent('[{"action":"move_and_take_object","parameters":{"object_id":"1"},"output":0}]')
+        agent.run_step({"task_id": "prompt-size", "task_type": "unknown", "subject": "测试提示"}, {})
         self.assertGreater(agent._competition.metrics.prompt_chars, 0)
         self.assertEqual(agent._competition.metrics.prompt_chars, agent._competition.metrics.max_prompt_chars)
+
+    def test_tidyroom_unknown_is_focused_before_visual_review(self) -> None:
+        response = (
+            '{"objects":[{"object_id":"1","role":"clutter","category":"cup","confidence":0.96,"target_id":null}]}'
+        )
+        agent, tongsim, client = self.make_agent(response)
+        tongsim.acquire_first_person_perception = lambda *args, **kwargs: {
+            "image": "QUJD",
+            "objects": [{"object_id": "1", "name": "Unknown", "color": "Red"}],
+        }
+        subject = {"task_id": "focused-review", "task_type": "tidyroom", "subject": "整理房间"}
+
+        first = agent.run_step(subject, {})
+        second = agent.run_step(subject, {})
+
+        self.assertEqual(first["result"], "success")
+        self.assertEqual(second["result"], "success")
+        self.assertEqual(tongsim.calls[0], ("look_at_object", "1"))
+        self.assertEqual(client.calls, 1)
+        self.assertEqual(agent._competition.objects["1"]["vlm_semantic_type"], "cup")
 
 
 if __name__ == "__main__":

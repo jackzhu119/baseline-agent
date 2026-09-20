@@ -14,6 +14,7 @@ from google.protobuf import struct_pb2
 from loguru import logger
 
 from arenaagent.agent_base import AgentBase, AgentCfg, parse_struct_to_data
+from arenaagent.build_info import agent_build
 from arenaagent.builder import Register
 from arenaagent.competition.runtime import ActionValidation, CompetitionRuntime
 from arenaagent.competition.solvers.tidyroom_policy import (
@@ -169,7 +170,10 @@ class VLMAgent(AgentBase):
         current_episode_id = self._competition.metrics.episode_id if self._competition.metrics else None
         if current_episode_id != previous_episode_id:
             self._reset_episode_state(subject)
-        self._competition.set_run_metadata(self._run_metadata())
+        run_metadata = self._run_metadata()
+        self._competition.set_run_metadata(run_metadata)
+        if current_episode_id != previous_episode_id:
+            logger.info("Agent build: {}", run_metadata["agent_build"])
 
         # 1/2/3: 获取感知（第一视角 + 可见物体映射）
         self._competition.record_vision_call()
@@ -258,10 +262,9 @@ class VLMAgent(AgentBase):
             self._record_competition_action(strategy_action, action_res, validation)
             return action_res if isinstance(action_res, dict) else {}
 
-        # TidyRoom uses the VLM as a batch visual classifier, not as a free-form
-        # one-object-at-a-time action planner.  This prevents the real-run
-        # look_at_object loop while still spending model budget where visual
-        # semantics are genuinely needed.
+        # TidyRoom uses the VLM only after a deterministic look_at_object action
+        # binds one public object ID to the centered pixels. It never delegates
+        # free-form robot actions to the model.
         if self._competition.task_type == "tidyroom":
             if (
                 not object_in_hand
@@ -274,18 +277,14 @@ class VLMAgent(AgentBase):
                 self._task_router.observe(self._competition, subject)
                 strategy_action = self._task_router.propose_action(subject, self._competition)
                 if strategy_action is not None:
-                    validation = self._competition.validate_action(
-                        strategy_action, object_in_hand=bool(object_in_hand)
-                    )
+                    validation = self._competition.validate_action(strategy_action, object_in_hand=bool(object_in_hand))
                     action_res = self._execute_validated_action(validation)
                     self._record_competition_action(strategy_action, action_res, validation)
                     return action_res if isinstance(action_res, dict) else {}
 
             recovery_action = self._tidyroom_progress_action()
             if recovery_action is not None:
-                validation = self._competition.validate_action(
-                    recovery_action, object_in_hand=bool(object_in_hand)
-                )
+                validation = self._competition.validate_action(recovery_action, object_in_hand=bool(object_in_hand))
                 action_res = self._execute_validated_action(validation)
                 self._record_competition_action(recovery_action, action_res, validation)
                 return action_res if isinstance(action_res, dict) else {}
@@ -433,27 +432,31 @@ class VLMAgent(AgentBase):
         self._tidy_classification = TidyObjectClassification()
 
     def _review_tidyroom_scene(self, image_data: str | None) -> list[dict[str, Any]]:
-        """Batch-classify uncertain visible objects and persist the verdicts."""
-        if not image_data or self.vlm_client is None:
-            return []
+        """Classify one camera-focused object so its ID is grounded in the image."""
         progress = self._competition.progress
-        review_ids = [
-            object_id
-            for object_id in sorted(progress.uncertain_items)
-            if object_id in self._competition.visible_canonical_ids
-        ][:12]
-        if not review_ids:
+        object_id = str(progress.focused_review_id or "")
+        current_step = self._competition.metrics.steps if self._competition.metrics is not None else -1
+        if (
+            not object_id
+            or progress.focused_review_step != current_step
+            or object_id not in progress.uncertain_items
+            or object_id not in self._competition.visible_canonical_ids
+        ):
+            return []
+        if not image_data or self.vlm_client is None:
+            if progress.begin_review_attempt(object_id):
+                progress.finish_review_attempt(object_id, resolved=False)
+            logger.warning("TidyRoom focused review lacks image/model evidence for {}", object_id)
+            return []
+        if not progress.begin_review_attempt(object_id):
             return []
 
-        review_objects: list[dict[str, Any]] = []
-        for object_id in review_ids:
-            item = self._competition.objects.get(object_id, {})
-            compact = {"object_id": object_id}
-            for key in ("name", "semantic_type", "category", "type", "color", "shape", "position"):
-                value = item.get(key)
-                if value not in (None, "", "Unknown", "unknown", [], {}):
-                    compact[key] = value
-            review_objects.append(compact)
+        item = self._competition.objects.get(object_id, {})
+        review_object = {"object_id": object_id}
+        for key in ("name", "semantic_type", "category", "type", "color", "shape", "position"):
+            value = item.get(key)
+            if value not in (None, "", "Unknown", "unknown", [], {}):
+                review_object[key] = value
 
         placements = {
             str(item.get("object_id")): item
@@ -475,17 +478,22 @@ class VLMAgent(AgentBase):
 
         instruction = (
             "You are the visual classification stage of a TidyRoom robot. "
-            "Inspect the CURRENT image once and classify EVERY candidate object listed below. "
+            "The camera was just aimed at exactly one object. Classify the centered/focused object only; "
+            "do not copy the appearance of nearby objects. "
             "Do not propose robot actions. Return exactly one JSON object with key 'objects'. "
-            "Each object must contain: object_id, is_clutter (boolean), category "
-            "(one of shoe,cup,bottle,food,trash,pillow,other), confidence (0..1), "
-            "and target_id (one visible target object_id below, or null). "
+            "The objects array must contain exactly one result with the supplied object_id, role "
+            "(clutter, target_surface, or other), category, confidence (0..1), and target_id. "
+            "For clutter, category is one of shoe,cup,bottle,food,trash,pillow. "
+            "For a usable destination, category is one of shoe_storage,trash_bin,soft_surface,"
+            "drinkware_surface,food_storage. Otherwise use role other and category other. "
             "Clutter means an item the task asks to tidy: cushions/pillows, shoes/boots/slippers, "
             "trash, food, cups/mugs/bottles. Furniture, walls, floors, fixtures and structural "
-            "objects are not clutter. Use target_id only when the visible target is semantically "
+            "objects are not clutter, but racks, bins, sofas/beds, tables/shelves and food storage "
+            "may be target_surface. Use target_id only for clutter when a listed target is semantically "
             "appropriate (shoe->rack/shelf, trash->bin, pillow->sofa/bed, drinkware->table/shelf, "
-            "food->cabinet/fridge/storage). Classify all candidate IDs exactly once.\n"
-            f"Candidate objects: {json.dumps(review_objects, ensure_ascii=False)}\n"
+            "food->cabinet/fridge/storage). If the focused pixels are ambiguous, lower confidence; "
+            "never guess from the numeric ID.\n"
+            f"Focused object: {json.dumps(review_object, ensure_ascii=False)}\n"
             f"Visible target surfaces: {json.dumps(target_options, ensure_ascii=False)}"
         )
         messages = [
@@ -507,13 +515,14 @@ class VLMAgent(AgentBase):
         self._competition.record_prompt_context(self._strip_image_urls(messages))
         response = self._invoke_model_with_recovery(messages)
         if response is None:
-            logger.warning("TidyRoom batch visual review failed; will change view and retry")
+            progress.finish_review_attempt(object_id, resolved=False)
+            logger.warning("TidyRoom focused visual review failed for {}; a bounded retry may follow", object_id)
             return []
 
         token_usage = getattr(response, "token_usage", None)
         if token_usage:
             logger.info(
-                "TidyRoom batch review Token Usage: prompt={}, completion={}, total={}",
+                "TidyRoom focused review Token Usage: prompt={}, completion={}, total={}",
                 token_usage.get("prompt_tokens", 0),
                 token_usage.get("completion_tokens", 0),
                 token_usage.get("total_tokens", 0),
@@ -524,20 +533,32 @@ class VLMAgent(AgentBase):
             parsed = parsed[0]
         raw_reviews = parsed.get("objects", []) if isinstance(parsed, dict) else []
         if not isinstance(raw_reviews, list):
-            logger.warning("TidyRoom batch review returned malformed JSON: {}", response_text)
+            progress.finish_review_attempt(object_id, resolved=False)
+            logger.warning("TidyRoom focused review returned malformed JSON: {}", response_text)
             return []
 
-        requested = set(review_ids)
         valid_reviews: list[dict[str, Any]] = []
-        allowed_categories = {"shoe", "cup", "bottle", "food", "trash", "pillow", "other"}
+        clutter_categories = {"shoe", "cup", "bottle", "food", "trash", "pillow"}
+        target_categories = {
+            "shoe_storage",
+            "trash_bin",
+            "soft_surface",
+            "drinkware_surface",
+            "food_storage",
+        }
         for raw in raw_reviews:
             if not isinstance(raw, dict):
                 continue
-            object_id = str(raw.get("object_id") or "")
-            if object_id not in requested or not isinstance(raw.get("is_clutter"), bool):
-                continue
+            returned_id = str(raw.get("object_id") or "")
+            role = str(raw.get("role") or "").strip().lower()
             category = str(raw.get("category") or "other").strip().lower()
-            if category not in allowed_categories:
+            if returned_id != object_id or role not in {"clutter", "target_surface", "other"}:
+                continue
+            if role == "clutter" and category not in clutter_categories:
+                category = "other"
+            elif role == "target_surface" and category not in target_categories:
+                category = "other"
+            elif role == "other":
                 category = "other"
             try:
                 confidence = float(raw.get("confidence", 0.0))
@@ -550,20 +571,30 @@ class VLMAgent(AgentBase):
             valid_reviews.append(
                 {
                     "object_id": object_id,
-                    "is_clutter": raw["is_clutter"],
+                    "role": role,
+                    "is_clutter": role == "clutter",
                     "category": category,
                     "confidence": max(0.0, min(confidence, 1.0)),
                     "target_id": target_id,
                 }
             )
+            break
 
-        progress.apply_vlm_reviews(valid_reviews)
+        if not valid_reviews:
+            progress.finish_review_attempt(object_id, resolved=False)
+            logger.warning("TidyRoom focused review did not return the requested object {}", object_id)
+            return []
+
+        progress.apply_vlm_reviews(valid_reviews, attempts_already_counted=True)
         reviewed_by_id = {item["object_id"]: item for item in valid_reviews}
         for object_id, review in reviewed_by_id.items():
-            if review["is_clutter"] and review["confidence"] >= 0.6 and review["category"] != "other":
-                item = self._competition.objects.get(object_id)
-                if isinstance(item, dict):
+            item = self._competition.objects.get(object_id)
+            if isinstance(item, dict) and review["confidence"] >= 0.6 and review["category"] != "other":
+                if review["role"] == "clutter":
                     item["vlm_semantic_type"] = review["category"]
+                elif review["role"] == "target_surface":
+                    item["vlm_target_type"] = review["category"]
+            if review["role"] == "clutter" and review["confidence"] >= 0.6 and review["category"] != "other":
                 target_id = review.get("target_id")
                 placement = placements.get(str(target_id), {}) if target_id else {}
                 location = placement.get("location")
@@ -573,7 +604,7 @@ class VLMAgent(AgentBase):
                         "location": location,
                         "source": str(placement.get("source") or "placement_candidate"),
                         "confidence": round(float(review["confidence"]), 3),
-                        "reason": "batch VLM visual review selected a visible semantic target",
+                        "reason": "focused VLM visual review selected a visible semantic target",
                     }
                     progress.set_target_assignment(
                         object_id,
@@ -588,18 +619,31 @@ class VLMAgent(AgentBase):
                     )
 
         logger.info(
-            "TidyRoom batch review: requested={} returned={} clutter={} non_clutter={} unresolved={}",
-            review_ids,
-            sorted(reviewed_by_id),
-            sorted(item["object_id"] for item in valid_reviews if item["is_clutter"]),
-            sorted(item["object_id"] for item in valid_reviews if not item["is_clutter"]),
+            "TidyRoom focused review: object={} role={} category={} confidence={} unresolved={} deferred={}",
+            object_id,
+            valid_reviews[0]["role"],
+            valid_reviews[0]["category"],
+            valid_reviews[0]["confidence"],
             sorted(progress.uncertain_items),
+            sorted(progress.deferred_items),
         )
         return valid_reviews
 
     def _tidyroom_progress_action(self) -> dict[str, Any] | None:
         """Advance camera coverage without returning to free-form per-object planning."""
         progress = self._competition.progress
+        reviewable_ids = sorted(progress.uncertain_items & self._competition.visible_canonical_ids)
+        if reviewable_ids:
+            canonical_id = reviewable_ids[0]
+            item = self._competition.objects.get(canonical_id, {})
+            current_id = str(item.get("current_object_id") or canonical_id)
+            return {
+                "think": "center one unresolved object before visual classification to bind pixels to its ID",
+                "action": "look_at_object",
+                "parameters": {"object_id": current_id},
+                "output": 0,
+                "expected_change": f"next frame is focused on unresolved object {canonical_id}",
+            }
         needs_new_view = bool(
             progress.uncertain_items
             or progress.remaining_candidates()
@@ -798,7 +842,7 @@ class VLMAgent(AgentBase):
         client_cfg = vlm_config.client_cfg
         prompt_fingerprint = self.prompt_generator.fingerprint() if self.prompt_generator else ""
         return {
-            "agent_build": "competition-runtime-v3",
+            "agent_build": agent_build(),
             "agent_class": type(self).__name__,
             "client_type": vlm_config.client_type,
             "model": client_cfg.name,

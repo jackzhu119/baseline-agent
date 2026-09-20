@@ -77,3 +77,8 @@ Round 4 的换机安装、环境验收、真实评测与结果打包步骤见
 
 每题结束后额外等待 15 秒的客户端生命周期分析及修复证据见
 [15_SECOND_TIMEOUT_ANALYSIS.md](15_SECOND_TIMEOUT_ANALYSIS.md)。
+
+截止日前 TidyRoom 最终加固、昨日真实失败根因和今日最短验收步骤见
+[TIDYROOM_DEADLINE_HARDENING.md](TIDYROOM_DEADLINE_HARDENING.md)。下一位开发者应从
+`fix/tidyroom-deadline-hardening` 继续，并直接使用
+[ROUND6_CONTINUATION_PROMPT.md](ROUND6_CONTINUATION_PROMPT.md)。

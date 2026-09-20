@@ -45,7 +45,9 @@ def test_tidyroom_full_prompt_deduplicates_and_stays_within_offline_budget(tmp_p
     compact_prompt = render(relevant)
     ids = [item["object_id"] for item in relevant]
 
-    assert ids == ["5"]
+    assert ids[0] == "5"
+    assert len(ids) == len(set(ids))
+    assert len(ids) == 1 + classifier.max_review_objects
     assert len(relevant) <= classifier.max_prompt_objects
     assert "world_aabb" not in compact_prompt
     assert len(compact_prompt) <= len(raw_prompt) * 0.6

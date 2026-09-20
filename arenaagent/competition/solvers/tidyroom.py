@@ -9,6 +9,8 @@ PLACEMENT_TOLERANCE = 15.0
 VECTOR_DIMENSIONS = 3
 MAX_PICK_ATTEMPTS = 2
 MAX_FINAL_SCANS = 2
+MAX_REVIEW_ATTEMPTS = 2
+MAX_PLACEMENT_VERIFICATION_VIEWS = 2
 
 
 def _as_ids(value: Any) -> set[str]:
@@ -23,6 +25,33 @@ def _failed(result: Any) -> bool:
         return False
     status = str(result.get("result") or result.get("status") or "").strip().lower()
     return status in {"failed", "failure", "error", "false"} or result.get("success") is False
+
+
+def _is_non_pickable_error(result: Any) -> bool:
+    """Recognize the heterogeneous English/Chinese errors returned by TongSIM."""
+    if not isinstance(result, dict):
+        return False
+    error_code = str(result.get("error_code") or result.get("code") or "").strip().lower()
+    if error_code in {"not_pickable", "object_not_pickable", "cannot_pickup", "cannot_take"}:
+        return True
+    text = " ".join(str(result.get(key) or "").strip().lower() for key in ("error", "message", "detail", "reason"))
+    patterns = (
+        "not pickup",
+        "not pickable",
+        "non-pickable",
+        "cannot pickup",
+        "can not pickup",
+        "cannot take",
+        "can not take",
+        "cannot be picked",
+        "can't take",
+        "无法拾取",
+        "不能拾取",
+        "不可拾取",
+        "无法拿取",
+        "不能拿取",
+    )
+    return any(pattern in text for pattern in patterns)
 
 
 def _number(value: Any) -> float | None:
@@ -110,12 +139,18 @@ class TidyRoomTracker:
     completion_evidence: bool = False
     candidate_items: set[str] = field(default_factory=set)
     rejected_items: set[str] = field(default_factory=set)
+    non_pickable_items: set[str] = field(default_factory=set)
     uncertain_items: set[str] = field(default_factory=set)
     target_surfaces: set[str] = field(default_factory=set)
     target_assignments: dict[str, dict[str, Any]] = field(default_factory=dict)
     object_attempt_registry: dict[str, ObjectAttemptState] = field(default_factory=dict)
     vlm_reviews: dict[str, dict[str, Any]] = field(default_factory=dict)
     review_attempts: Counter[str] = field(default_factory=Counter)
+    deferred_items: set[str] = field(default_factory=set)
+    focused_review_id: str | None = None
+    focused_review_step: int = -1
+    placement_verification_attempts: Counter[str] = field(default_factory=Counter)
+    placement_evidence: dict[str, str] = field(default_factory=dict)
     final_scan_count: int = 0
     coverage_verified: bool = False
 
@@ -135,12 +170,18 @@ class TidyRoomTracker:
         self.completion_evidence = False
         self.candidate_items = set()
         self.rejected_items = set()
+        self.non_pickable_items = set()
         self.uncertain_items = set()
         self.target_surfaces = set()
         self.target_assignments = {}
         self.object_attempt_registry = {}
         self.vlm_reviews = {}
         self.review_attempts = Counter()
+        self.deferred_items = set()
+        self.focused_review_id = None
+        self.focused_review_step = -1
+        self.placement_verification_attempts = Counter()
+        self.placement_evidence = {}
         self.final_scan_count = 0
         self.coverage_verified = False
 
@@ -152,14 +193,17 @@ class TidyRoomTracker:
         uncertain_items: set[str],
         target_surfaces: set[str] | None = None,
     ) -> None:
-        newly_discovered = candidate_items - self.candidate_items - self.completed_objects
-        self.candidate_items.update(candidate_items - self.completed_objects)
+        eligible_candidates = candidate_items - self.completed_objects - self.non_pickable_items - self.deferred_items
+        newly_discovered = eligible_candidates - self.candidate_items
+        self.candidate_items.update(eligible_candidates)
         self.rejected_items.update(rejected_items)
         # Uncertainty is view-local: keep only currently unresolved visible objects.
         # This allows the VLM to review the current camera view without permanently
         # blocking completion because of stale Unknown objects seen many turns ago.
         self.uncertain_items = set(uncertain_items)
-        self.uncertain_items.difference_update(self.candidate_items | self.rejected_items | self.completed_objects)
+        self.uncertain_items.difference_update(
+            self.candidate_items | self.rejected_items | self.completed_objects | self.deferred_items
+        )
         self.target_surfaces.update(target_surfaces or set())
         for object_id in self.candidate_items:
             self.states.setdefault(object_id, "DISCOVERED")
@@ -167,8 +211,41 @@ class TidyRoomTracker:
         if newly_discovered:
             self.record_final_scan(discovered_new_candidate=True)
 
-    def apply_vlm_reviews(self, reviews: list[dict[str, Any]], confidence_threshold: float = 0.6) -> None:
-        """Persist batch visual classifications so reviewed IDs are not re-reviewed forever."""
+    def focus_review(self, object_id: str, step: int) -> bool:
+        object_id = str(object_id)
+        if object_id not in self.uncertain_items or self.review_attempts[object_id] >= MAX_REVIEW_ATTEMPTS:
+            return False
+        self.focused_review_id = object_id
+        self.focused_review_step = int(step)
+        return True
+
+    def begin_review_attempt(self, object_id: str) -> bool:
+        object_id = str(object_id)
+        if object_id not in self.uncertain_items or self.review_attempts[object_id] >= MAX_REVIEW_ATTEMPTS:
+            return False
+        self.review_attempts[object_id] += 1
+        return True
+
+    def finish_review_attempt(self, object_id: str, *, resolved: bool) -> None:
+        object_id = str(object_id)
+        if self.focused_review_id == object_id:
+            self.focused_review_id = None
+            self.focused_review_step = -1
+        if not resolved and self.review_attempts[object_id] >= MAX_REVIEW_ATTEMPTS:
+            # Two independently focused views are the bounded evidence budget.
+            # Keep this distinct from a negative classification for auditability.
+            self.uncertain_items.discard(object_id)
+            self.deferred_items.add(object_id)
+            self.states[object_id] = "DEFERRED_AMBIGUOUS"
+
+    def apply_vlm_reviews(
+        self,
+        reviews: list[dict[str, Any]],
+        confidence_threshold: float = 0.6,
+        *,
+        attempts_already_counted: bool = False,
+    ) -> None:
+        """Persist focused visual classifications so reviewed IDs are not re-reviewed forever."""
         for review in reviews:
             if not isinstance(review, dict):
                 continue
@@ -176,41 +253,52 @@ class TidyRoomTracker:
             if not object_id or object_id not in self.uncertain_items:
                 continue
             is_clutter = review.get("is_clutter")
+            role = str(review.get("role") or "").strip().lower()
+            if role not in {"clutter", "target_surface", "other"}:
+                role = "clutter" if is_clutter is True else "other" if is_clutter is False else ""
             category = str(review.get("category") or "other").strip().lower()
             try:
                 confidence = float(review.get("confidence", 0.0))
             except (TypeError, ValueError):
                 confidence = 0.0
             confidence = max(0.0, min(confidence, 1.0))
-            self.review_attempts[object_id] += 1
+            if not attempts_already_counted:
+                if not self.begin_review_attempt(object_id):
+                    continue
             stored = {
                 "object_id": object_id,
                 "is_clutter": is_clutter if isinstance(is_clutter, bool) else None,
+                "role": role or None,
                 "category": category,
                 "confidence": round(confidence, 3),
                 "target_id": (
-                    str(review.get("target_id"))
-                    if review.get("target_id") not in (None, "", "null")
-                    else None
+                    str(review.get("target_id")) if review.get("target_id") not in (None, "", "null") else None
                 ),
             }
             self.vlm_reviews[object_id] = stored
-            if not isinstance(is_clutter, bool) or confidence < confidence_threshold:
+            if not role or confidence < confidence_threshold:
+                self.finish_review_attempt(object_id, resolved=False)
                 continue
-            # "clutter + other" is not actionable enough to pick safely; keep it
-            # unresolved so another viewpoint/model pass can name a task category.
-            if is_clutter and category == "other":
+            if role in {"clutter", "target_surface"} and category == "other":
+                self.finish_review_attempt(object_id, resolved=False)
                 continue
             self.uncertain_items.discard(object_id)
-            if is_clutter:
+            self.deferred_items.discard(object_id)
+            if role == "clutter":
                 self.rejected_items.discard(object_id)
                 self.candidate_items.add(object_id)
                 self.states.setdefault(object_id, "DISCOVERED")
                 self.object_attempt_registry.setdefault(object_id, ObjectAttemptState(object_id))
                 self.record_final_scan(discovered_new_candidate=True)
+            elif role == "target_surface":
+                self.candidate_items.discard(object_id)
+                self.rejected_items.add(object_id)
+                self.target_surfaces.add(object_id)
+                self.states[object_id] = "TARGET_SURFACE"
             else:
                 self.candidate_items.discard(object_id)
                 self.rejected_items.add(object_id)
+            self.finish_review_attempt(object_id, resolved=True)
 
     def set_target_assignment(self, object_id: str, assignment: dict[str, Any]) -> None:
         self.target_assignments[str(object_id)] = assignment
@@ -282,9 +370,11 @@ class TidyRoomTracker:
             is_fresh = observation_step is not None and item.get("position_seen_step") == observation_step
             position = _object_position(item) if is_fresh else None
             if position is None or self.pending_place_target is None:
+                if self.placement_verification_attempts[object_id] >= MAX_PLACEMENT_VERIFICATION_VIEWS:
+                    self._verify_placement(object_id, "successful put + empty hand + two target reinspections")
                 return
             if math.dist(position, self.pending_place_target) <= PLACEMENT_TOLERANCE:
-                self._verify_placement(object_id)
+                self._verify_placement(object_id, "fresh object position is within target tolerance")
             else:
                 self._clear_pending_place()
                 self._record_failure(object_id, observation_step or 0)
@@ -298,6 +388,8 @@ class TidyRoomTracker:
     ) -> None:
         name = str(action.get("action") or "").lower()
         object_id = canonical_object_id or self.current_object or ""
+        if name == "look_at_location" and self.pending_place is not None and not _failed(result):
+            self.placement_verification_attempts[self.pending_place] += 1
         attempt = (
             self.object_attempt_registry.setdefault(object_id, ObjectAttemptState(object_id)) if object_id else None
         )
@@ -309,13 +401,12 @@ class TidyRoomTracker:
             elif name in {"put_down_sth", "move_and_put_down", "move_and_put_down_object_in_container"}:
                 attempt.put_attempts += 1
         if _failed(result):
+            if name == "look_at_object" and object_id:
+                if self.begin_review_attempt(object_id):
+                    self.finish_review_attempt(object_id, resolved=False)
+                return
             if object_id and name == "move_and_take_object":
-                error_text = (
-                    str(result.get("error") or result.get("message") or "").lower()
-                    if isinstance(result, dict)
-                    else ""
-                )
-                if "not pickup" in error_text or "cannot take" in error_text or "can not take" in error_text:
+                if _is_non_pickable_error(result):
                     # Real TongSIM uses this error for scene objects that are not
                     # physically pickable.  Treat it as negative object evidence
                     # instead of poisoning the episode with an unresolved failure.
@@ -323,6 +414,7 @@ class TidyRoomTracker:
                     self.uncertain_items.discard(object_id)
                     self.failed_objects.discard(object_id)
                     self.rejected_items.add(object_id)
+                    self.non_pickable_items.add(object_id)
                     self.states[object_id] = "REJECTED_NON_PICKABLE"
                     if attempt is not None:
                         attempt.failed = True
@@ -330,6 +422,8 @@ class TidyRoomTracker:
             if object_id:
                 self._record_failure(object_id, step)
             return
+        if name == "look_at_object" and object_id in self.uncertain_items:
+            self.focus_review(object_id, step)
         if name in {"move_to_object", "look_at_object"} and object_id:
             self.states[object_id] = "APPROACHING"
         elif name == "move_and_take_object" and object_id:
@@ -345,6 +439,7 @@ class TidyRoomTracker:
                 self.pending_place_mode = (
                     "atomic_container" if name == "move_and_put_down_object_in_container" else "coordinate"
                 )
+                self.placement_verification_attempts[self.current_object] = 0
                 self.states[self.current_object] = "PLACED"
         elif name in {
             "pour_water",
@@ -375,13 +470,14 @@ class TidyRoomTracker:
                 return location
         return None
 
-    def _verify_placement(self, object_id: str) -> None:
+    def _verify_placement(self, object_id: str, basis: str = "official completion evidence") -> None:
         self.completed_objects.add(object_id)
         self.expected_objects.discard(object_id)
         self.states[object_id] = "VERIFIED"
         attempt = self.object_attempt_registry.setdefault(object_id, ObjectAttemptState(object_id))
         attempt.completed = True
         attempt.failed = False
+        self.placement_evidence[object_id] = basis
         self._clear_pending_place()
 
     def _clear_pending_place(self) -> None:
@@ -429,14 +525,19 @@ class TidyRoomTracker:
             "completion_evidence": self.completion_evidence,
             "candidate_items": sorted(self.candidate_items - self.completed_objects),
             "rejected_items": sorted(self.rejected_items),
+            "non_pickable_items": sorted(self.non_pickable_items),
             "uncertain_items": sorted(self.uncertain_items),
             "target_surfaces": sorted(self.target_surfaces),
             "target_assignments": dict(sorted(self.target_assignments.items())),
             "vlm_reviews": dict(sorted(self.vlm_reviews.items())),
             "review_attempts": dict(sorted(self.review_attempts.items())),
+            "deferred_items": sorted(self.deferred_items),
+            "focused_review_id": self.focused_review_id,
+            "focused_review_step": self.focused_review_step,
+            "placement_verification_attempts": dict(sorted(self.placement_verification_attempts.items())),
+            "placement_evidence": dict(sorted(self.placement_evidence.items())),
             "object_attempt_registry": {
-                object_id: attempt.context()
-                for object_id, attempt in sorted(self.object_attempt_registry.items())
+                object_id: attempt.context() for object_id, attempt in sorted(self.object_attempt_registry.items())
             },
             "final_scan_count": self.final_scan_count,
             "coverage_verified": self.coverage_verified,
@@ -448,19 +549,17 @@ class TidyRoomTracker:
         context["candidate_items"] = context["candidate_items"][:limit]
         context["rejected_count"] = len(self.rejected_items)
         context["uncertain_count"] = len(self.uncertain_items)
+        context["deferred_count"] = len(self.deferred_items)
         context["rejected_items"] = context["rejected_items"][:5]
         context["uncertain_items"] = context["uncertain_items"][:5]
+        context["deferred_items"] = context["deferred_items"][:5]
         context["target_surfaces"] = context["target_surfaces"][:limit]
         context["vlm_reviews"] = dict(list(context["vlm_reviews"].items())[-limit:])
         relevant_attempts = set(context["candidate_items"]) | self.completed_objects
         context["object_attempt_registry"] = {
-            key: value
-            for key, value in context["object_attempt_registry"].items()
-            if key in relevant_attempts
+            key: value for key, value in context["object_attempt_registry"].items() if key in relevant_attempts
         }
         context["target_assignments"] = {
-            key: value
-            for key, value in context["target_assignments"].items()
-            if key in relevant_attempts
+            key: value for key, value in context["target_assignments"].items() if key in relevant_attempts
         }
         return context
